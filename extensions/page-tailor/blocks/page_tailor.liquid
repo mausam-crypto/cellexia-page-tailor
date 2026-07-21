@@ -1,0 +1,239 @@
+{% if request.page_type == 'product' %}
+<script>
+/* Page Tailor — variant copy swapper.
+   ABSOLUTE RULES: no user-agent or bot detection of any kind, no referrer
+   logic, no random sampling — the same URL must render the same content for
+   every visitor. Never touches canonical tags, JSON-LD, price, or any element
+   outside the configured ops selectors. Every failure falls open to the
+   normal page. */
+(function () {
+  try {
+    var PARAM = {{ block.settings.param_name | json }};
+    var PROXY = {{ block.settings.proxy_path | json }};
+    var HIDE = {{ block.settings.hide_selectors | json }};
+    var MAX_HOLD = {{ block.settings.max_hide_ms | json }};
+    var LOCALE = {{ request.locale.iso_code | json }};
+
+    /* Handles may be percent-encoded non-ASCII (CJK etc.). */
+    var pathMatch = location.pathname.match(/\/products\/([^\/?#]+)/);
+    if (!pathMatch) return;
+    var product = pathMatch[1];
+    try { product = decodeURIComponent(product); } catch (e) {}
+
+    /* "variant" is Shopify's own product-option param — never hijack it. */
+    var paramOk = PARAM && PARAM !== 'variant' && /^[a-z0-9_]{1,12}$/.test(PARAM);
+    var handle = paramOk ? new URLSearchParams(location.search).get(PARAM) : null;
+    if (handle && !/^[a-z0-9]{4,16}$/.test(handle)) handle = null;
+
+    /* Anonymous page-view beacon for the experiment tracker: product handle,
+       language, and whether this visit ARRIVED VIA a variant URL (regardless
+       of whether the swap later succeeds). Fired identically for every
+       visitor — no IDs, no cookies, fire-and-forget. Skipped in the theme
+       editor and during prerendering so counts reflect real visits. */
+    try {
+      var editing = window.Shopify && window.Shopify.designMode;
+      var prerendering = typeof document.prerendering !== 'undefined' && document.prerendering;
+      var base = String(PROXY || '').replace(/\/+$/, '');
+      var slash = base.lastIndexOf('/');
+      var hitPath = slash > 0 ? base.slice(0, slash) + '/hit' : '/apps/cx/hit';
+      var fireBeacon = function () {
+        fetch(hitPath + '?product=' + encodeURIComponent(product) +
+          '&locale=' + encodeURIComponent(LOCALE) +
+          '&v=' + (handle ? '1' : '0'),
+          { credentials: 'omit', keepalive: true }).catch(function () {});
+      };
+      if (!editing) {
+        if (prerendering) {
+          /* Count the view when the prerendered page becomes a real visit,
+             not never — otherwise Chrome speculation-rules traffic silently
+             undercounts and skews experiment conversion rates. */
+          document.addEventListener('prerenderingchange', fireBeacon, { once: true });
+        } else {
+          fireBeacon();
+        }
+      }
+    } catch (e) {}
+
+    if (!handle) return;
+
+    /* Anti-flicker hold: briefly hide configured regions; always fails open. */
+    var held = false;
+    var holdTimer = null;
+    function release() {
+      if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
+      if (!held) return;
+      held = false;
+      try {
+        var s = document.getElementById('cx-hold');
+        if (s && s.parentNode) s.parentNode.removeChild(s);
+      } catch (e) {}
+    }
+    /* The hold list comes from a free-text theme setting; never let it hide
+       commerce-critical elements, whatever was typed there. */
+    var safeHide = '';
+    try {
+      var hideParts = String(HIDE || '').split(',');
+      var kept = [];
+      for (var h = 0; h < hideParts.length; h++) {
+        var hp = hideParts[h].trim();
+        if (!hp) continue;
+        /* Bare element tokens (boundary-matched so ".product__description"
+           is NOT caught by "script" and ".body-copy" is not caught by
+           "body"). */
+        if (/(^|[\s>+~,(])(script|style|meta|link|base|title|iframe|head|html|body|main|form|button|template|noscript)(?![\w-])/i.test(hp)) continue;
+        /* Commerce keywords at a token start ("preview" must not match
+           "review"), plus universal selector and CSS escapes. */
+        if (/(^|[^a-z0-9])(price|review|rating|cart|checkout|payment)/i.test(hp)) continue;
+        if (hp.indexOf('*') !== -1 || hp.indexOf('\\') !== -1) continue;
+        if (!/[.#\[]/.test(hp)) continue;
+        kept.push(hp);
+      }
+      safeHide = kept.join(',');
+    } catch (e) { safeHide = ''; }
+    if (MAX_HOLD > 0 && safeHide) {
+      try {
+        var st = document.createElement('style');
+        st.id = 'cx-hold';
+        st.textContent = safeHide + '{visibility:hidden !important}';
+        (document.head || document.documentElement).appendChild(st);
+        held = true;
+        holdTimer = setTimeout(release, MAX_HOLD);
+      } catch (e) { release(); }
+    }
+
+    /* Key includes the product handle so one product's cached payload can
+       never be applied on another product's page. */
+    var cacheKey = 'pt:' + product + ':' + handle + ':' + LOCALE;
+    function validPayload(p) {
+      if (!p || Object.prototype.toString.call(p.ops) !== '[object Array]') return false;
+      for (var k = 0; k < p.ops.length; k++) {
+        var o = p.ops[k];
+        if (!o || typeof o.selector !== 'string' || typeof o.content !== 'string') return false;
+      }
+      return true;
+    }
+    function readCache() {
+      try {
+        var raw = sessionStorage.getItem(cacheKey);
+        if (!raw) return null;
+        var obj = JSON.parse(raw);
+        if (!obj || !obj.p || (Date.now() - obj.t) > 120000) return null;
+        if (!validPayload(obj.p)) return null;
+        return obj.p;
+      } catch (e) { return null; }
+    }
+    function writeCache(p) {
+      try {
+        sessionStorage.setItem(cacheKey, JSON.stringify({ t: Date.now(), p: p }));
+      } catch (e) {}
+    }
+
+    var payload = null;
+    function apply() {
+      if (!payload || !payload.ops || !payload.ops.length) { release(); return; }
+      var swapped = 0;
+      for (var i = 0; i < payload.ops.length; i++) {
+        /* Per-op try/catch: one malformed selector must not abort the rest. */
+        try {
+          var op = payload.ops[i];
+          if (!op || !op.selector || typeof op.content !== 'string') continue;
+          var els = document.querySelectorAll(op.selector);
+          for (var j = 0; j < els.length; j++) {
+            if (op.mode === 'html') els[j].innerHTML = op.content;
+            else els[j].textContent = op.content;
+            swapped++;
+          }
+        } catch (e) {}
+      }
+      /* Only mark applied when something actually swapped, so "served but
+         zero selectors matched" is distinguishable when debugging a theme. */
+      try { if (swapped > 0) document.documentElement.dataset.ptApplied = '1'; } catch (e) {}
+      release();
+    }
+    function schedule() {
+      if (document.readyState !== 'loading') apply();
+      else document.addEventListener('DOMContentLoaded', apply);
+    }
+
+    /* Themes re-render sections (editor + dynamic); re-apply without hold. */
+    document.addEventListener('shopify:section:load', function () {
+      if (payload) apply();
+    });
+
+    var cached = readCache();
+    if (cached) {
+      payload = cached;
+      schedule();
+      return;
+    }
+
+    /* Late-arrival guard: a payload that arrives long after the anti-flicker
+       hold has released must not replace copy the visitor is already
+       reading. Cache it for the next navigation instead. Deadline depends
+       only on elapsed time, never on who the visitor is. */
+    var fetchStart = Date.now();
+    var APPLY_DEADLINE = Math.max(MAX_HOLD || 0, 4000);
+    fetch(
+      PROXY + '?product=' + encodeURIComponent(product) +
+        '&v=' + encodeURIComponent(handle) +
+        '&locale=' + encodeURIComponent(LOCALE),
+      { credentials: 'omit' }
+    )
+      .then(function (res) {
+        if (!res.ok) throw new Error('bad status');
+        return res.json();
+      })
+      .then(function (json) {
+        if (!validPayload(json)) throw new Error('bad payload');
+        writeCache(json);
+        if (Date.now() - fetchStart > APPLY_DEADLINE) { release(); return; }
+        payload = json;
+        schedule();
+      })
+      .catch(function () { release(); });
+  } catch (e) {
+    try {
+      var hold = document.getElementById('cx-hold');
+      if (hold && hold.parentNode) hold.parentNode.removeChild(hold);
+    } catch (e2) {}
+  }
+})();
+</script>
+{% endif %}
+{% schema %}
+{
+  "name": "Page Tailor",
+  "target": "head",
+  "settings": [
+    {
+      "type": "text",
+      "id": "param_name",
+      "label": "URL parameter name",
+      "default": "cx",
+      "info": "Must match the app's Settings page."
+    },
+    {
+      "type": "text",
+      "id": "proxy_path",
+      "label": "Proxy path",
+      "default": "/apps/cx/variant"
+    },
+    {
+      "type": "textarea",
+      "id": "hide_selectors",
+      "label": "Selectors to hold during swap",
+      "default": ".product__description",
+      "info": "Comma-separated CSS selectors briefly hidden to avoid a flash of the original copy. Only list the copy regions the app adapts — never price, buy buttons, or reviews."
+    },
+    {
+      "type": "range",
+      "id": "max_hide_ms",
+      "label": "Max hold time (ms)",
+      "min": 0,
+      "max": 2000,
+      "step": 100,
+      "default": 800
+    }
+  ]
+}
+{% endschema %}

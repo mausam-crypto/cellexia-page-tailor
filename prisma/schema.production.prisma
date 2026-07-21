@@ -1,0 +1,167 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Per-shop configuration: which copy surfaces may be adapted and how they map
+// onto the storefront DOM. Surfaces are stored as a JSON array of
+// { key, label, source, namespace?, metafieldKey?, selector, mode }.
+model ShopSettings {
+  shop           String   @id
+  paramName      String   @default("cx")
+  intensity      String   @default("light") // light | medium
+  surfaces       String   @default("[]")
+  // Master kill switch. OFF by default: a fresh install never changes
+  // anything on the storefront until the merchant explicitly enables serving.
+  servingEnabled Boolean  @default(false)
+  updatedAt      DateTime @updatedAt
+}
+
+// One row per (day, product, locale): storefront page views recorded by the
+// theme embed's beacon. variantViews counts views that ARRIVED via a variant
+// URL (a well-formed ?cx value) — it does not verify that a variant was
+// served or applied, so it keeps counting while serving is switched off.
+model DailyStat {
+  id            String @id @default(cuid())
+  shop          String
+  dateKey       String // YYYY-MM-DD, UTC
+  productHandle String
+  locale        String
+  views         Int    @default(0)
+  variantViews  Int    @default(0)
+
+  @@unique([shop, dateKey, productHandle, locale])
+  @@index([shop, productHandle])
+}
+
+// One row per (order, product) for products under experiment, synced on
+// demand from the Admin API. Amounts are in the shop currency.
+model OrderLine {
+  id             String  @id @default(cuid())
+  shop           String
+  orderId        String
+  productId      String // product GID
+  dateKey        String // YYYY-MM-DD, UTC (order created_at)
+  units          Int
+  lineRevenue    Float
+  orderTotal     Float
+  customerLocale String?
+
+  @@unique([orderId, productId])
+  @@index([shop, productId, dateKey])
+}
+
+// A sequential baseline/treatment comparison for one product + locale.
+// NOT an A/B test: the two windows are consecutive time periods and only one
+// version of the page is ever live for a given market at a time.
+model Experiment {
+  id              String    @id @default(cuid())
+  shop            String
+  productId       String
+  productHandle   String
+  productTitle    String
+  locale          String
+  status          String    @default("running") // running | completed | stopped
+  baselineStart   DateTime
+  baselineEnd     DateTime // == treatmentStart
+  treatmentStart  DateTime
+  treatmentEnd    DateTime
+  stoppedAt       DateTime?
+  stopReason      String?
+  lastOrderSyncAt DateTime?
+  createdAt       DateTime  @default(now())
+
+  @@index([shop, status])
+}
+
+// One row per marketing article. Each approved article yields exactly one
+// variant URL: {product url}?{paramName}={variantHandle}.
+model Article {
+  id            String     @id @default(cuid())
+  shop          String
+  productId     String // Shopify product GID
+  productHandle String
+  productTitle  String
+  locale        String // shop locale code, e.g. "en", "fr"
+  sourceUrl     String?
+  sourceTitle   String?
+  sourceText    String? // extracted article body used for analysis
+  detectedQuery String?
+  queryVariants String? // JSON string[]
+  evidence      String? // JSON string[] of article phrases supporting the query inference
+  status        String     @default("pending") // pending | generated | approved | archived | error
+  errorMessage  String?
+  // In-flight generation lock: set while a generation runs so concurrent
+  // runs are rejected and approve/save are blocked against copy in motion.
+  // Locks older than 15 minutes are treated as stale (crashed run).
+  generatingAt  DateTime?
+  // True once the article has ever been live: lets the UI distinguish
+  // "taken offline" from "never live".
+  wasApproved   Boolean    @default(false)
+  // Post-publication review model: generation puts the variant live
+  // immediately and resets reviewedAt to null; the merchant is notified and
+  // marks it reviewed (or takes it offline). Null = live awaiting review.
+  reviewedAt    DateTime?
+  // Meta mode: set per URL batch at creation. Generation rewrites much more
+  // aggressively and pulls the article's specific proof elements (study wins,
+  // rankings, statistics) into the copy. Takes effect at generation time.
+  metaMode      Boolean    @default(false)
+  // Snapshot of metaMode at last generation: edit-time finding
+  // reclassification must follow the mode the stored copy was generated
+  // under, not the live toggle (which only affects the next generation).
+  generatedMetaMode Boolean @default(false)
+  proofPoints   String? // JSON [{claim, quote, verified}]: article proof elements used in meta mode
+  variantHandle String     @unique // opaque slug used in the public URL
+  overrides     Override[]
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  @@index([shop, productId, locale])
+  @@index([shop, status])
+}
+
+// One adapted copy surface within an article's variant.
+model Override {
+  id         String  @id @default(cuid())
+  articleId  String
+  article    Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  surfaceKey String
+  label      String
+  selector   String
+  mode       String // "text" | "html"
+  original   String
+  adapted    String
+  notes         String?
+  warnings      String? // JSON string[]: unsupported claims + risky patterns; block approval until attested
+  articleClaims String? // JSON string[]: new claims grounded in the source article; shown for review, covered by the same attestation
+  enabled       Boolean @default(true)
+
+  @@unique([articleId, surfaceKey])
+}
+
+model Session {
+  id                  String    @id
+  shop                String
+  state               String
+  isOnline            Boolean   @default(false)
+  scope               String?
+  expires             DateTime?
+  accessToken         String
+  userId              BigInt?
+  firstName           String?
+  lastName            String?
+  email               String?
+  accountOwner        Boolean   @default(false)
+  locale              String?
+  collaborator        Boolean?  @default(false)
+  emailVerified       Boolean?  @default(false)
+  refreshToken        String?
+  refreshTokenExpires DateTime?
+}

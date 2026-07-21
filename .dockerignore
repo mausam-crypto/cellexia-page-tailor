@@ -1,0 +1,10 @@
+.cache
+build
+node_modules
+.DS_Store
+# Never bake local secrets or the local dev database into an image.
+.env
+.env.*
+prisma/dev.sqlite
+prisma/dev.sqlite-journal
+.shopify
