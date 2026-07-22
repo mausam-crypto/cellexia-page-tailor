@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
-import { useFetcher, useLoaderData, useNavigate } from "@remix-run/react";
+import {
+  useFetcher,
+  useLoaderData,
+  useNavigate,
+  useRevalidator,
+} from "@remix-run/react";
 import {
   Badge,
   Banner,
@@ -28,8 +33,13 @@ import {
 } from "../services/shopify-data.server";
 import {
   buildVariantUrl,
-  generateForArticle,
+  isGenerationInFlight,
+  isQueuedFresh,
 } from "../services/variant.server";
+import {
+  enqueueGeneration,
+  kickGenerationQueue,
+} from "../services/generation-queue.server";
 import {
   computeExperimentReport,
   refreshExperimentStatus,
@@ -38,6 +48,10 @@ import {
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
+
+  // Restart recovery: if a previous process died with queued articles, this
+  // nudges the background worker back to life. No-op when idle.
+  kickGenerationQueue();
 
   const [articles, settings, runningExperiments, beaconRows] =
     await Promise.all([
@@ -136,6 +150,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       status: article.status,
       metaMode: article.metaMode,
       reviewedAt: article.reviewedAt ? article.reviewedAt.toISOString() : null,
+      queued: isQueuedFresh(article),
+      generating: isGenerationInFlight(article),
       errorMessage: article.errorMessage,
       overrideCount: article.overrides.length,
       hasWarnings: article.overrides.some((o) => o.warnings || o.articleClaims),
@@ -155,26 +171,42 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
+  const { session } = await authenticate.admin(request);
   const formData = await request.formData();
   const intent = String(formData.get("intent") ?? "");
   const articleId = String(formData.get("articleId") ?? "");
 
+  // Generation is queued server-side and runs in the background: the
+  // response returns immediately and the work continues even if the admin
+  // closes the page. Several articles generate in parallel.
   if (intent === "generate" && articleId) {
-    try {
-      await generateForArticle(admin, session.shop, articleId);
-      return { ok: true, articleId, error: null };
-    } catch (error) {
-      // Real failures record status "error" + errorMessage on the row; lock
-      // rejections do not touch the row, so surface the message here. ok
-      // stays true so a client-side "generate all" chain keeps going.
-      console.error(`Generation failed for article ${articleId}`, error);
-      return {
-        ok: true,
-        articleId,
-        error: error instanceof Error ? error.message : "Generation failed.",
-      };
-    }
+    const { queued } = await enqueueGeneration(session.shop, [articleId]);
+    return {
+      ok: true,
+      articleId,
+      queued,
+      error: queued === 0 ? "Already generating or queued." : null,
+    };
+  }
+
+  if (intent === "generateAll") {
+    const pending = await prisma.article.findMany({
+      where: { shop: session.shop, status: { in: ["pending", "error"] } },
+      select: { id: true },
+    });
+    const { queued } = await enqueueGeneration(
+      session.shop,
+      pending.map((a) => a.id),
+    );
+    return {
+      ok: true,
+      articleId: null,
+      queued,
+      error:
+        queued === 0
+          ? "Nothing to queue - these articles are already queued or generating."
+          : null,
+    };
   }
 
   if (intent === "delete" && articleId) {
@@ -298,69 +330,38 @@ export default function Index() {
   const navigate = useNavigate();
   const generateFetcher = useFetcher<typeof action>();
 
-  // Sequential "generate all" chain: one article at a time, because each
-  // generation takes ~1-2 minutes (two Claude calls).
-  const [queue, setQueue] = useState<string[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
-  const [totalQueued, setTotalQueued] = useState(0);
-  const [doneCount, setDoneCount] = useState(0);
   const [selectedTab, setSelectedTab] = useState(0);
   const [searchQuery, setSearchQuery] = useState("");
+  const revalidator = useRevalidator();
 
-  // The queue lives in this page's state: closing or leaving the page
-  // abandons the not-yet-started articles. Warn before that happens.
+  const queuedCount = articles.filter((a) => a.queued).length;
+  const generatingCount = articles.filter((a) => a.generating).length;
+  const busyCount = queuedCount + generatingCount;
+
+  // Generation runs in a server-side background queue; poll while anything
+  // is queued or running so badges and the review notification stay fresh
+  // without the merchant doing anything.
   useEffect(() => {
-    if (!activeId) return;
-    const warn = (event: BeforeUnloadEvent) => {
-      event.preventDefault();
-      event.returnValue = "";
-    };
-    window.addEventListener("beforeunload", warn);
-    return () => window.removeEventListener("beforeunload", warn);
-  }, [activeId]);
-
-  const startGeneration = useCallback(
-    (ids: string[]) => {
-      if (ids.length === 0 || activeId) return;
-      setTotalQueued(ids.length);
-      setDoneCount(0);
-      setQueue(ids.slice(1));
-      setActiveId(ids[0]);
-      generateFetcher.submit(
-        { intent: "generate", articleId: ids[0] },
-        { method: "POST" },
-      );
-    },
-    [activeId, generateFetcher],
-  );
+    if (busyCount === 0) return;
+    const timer = setInterval(() => {
+      if (revalidator.state === "idle") revalidator.revalidate();
+    }, 7000);
+    return () => clearInterval(timer);
+  }, [busyCount, revalidator]);
 
   useEffect(() => {
-    if (generateFetcher.state !== "idle") return;
+    if (generateFetcher.state !== "idle" || !generateFetcher.data) return;
     const data = generateFetcher.data;
-    // Only advance when the response we hold is for the article in flight.
-    if (!data || !activeId || data.articleId !== activeId) return;
     if ("error" in data && data.error) {
       shopify.toast.show(String(data.error), { isError: true });
-    }
-    setDoneCount((count) => count + 1);
-    if (queue.length > 0) {
-      const [next, ...rest] = queue;
-      setQueue(rest);
-      setActiveId(next);
-      generateFetcher.submit(
-        { intent: "generate", articleId: next },
-        { method: "POST" },
+    } else if ("queued" in data && typeof data.queued === "number" && data.queued > 0) {
+      shopify.toast.show(
+        data.queued === 1
+          ? "Generation started in the background — you can leave this page."
+          : `${data.queued} generations started in the background — you can leave this page.`,
       );
-    } else {
-      setActiveId(null);
-      if (totalQueued > 1) {
-        shopify.toast.show(
-          "Generation finished — new variants are live and awaiting your review.",
-        );
-      }
-      setTotalQueued(0);
     }
-  }, [generateFetcher, generateFetcher.state, generateFetcher.data, activeId, queue, totalQueued, shopify]);
+  }, [generateFetcher.state, generateFetcher.data, shopify]);
 
   const copyUrl = useCallback(
     async (url: string) => {
@@ -374,11 +375,9 @@ export default function Index() {
     [shopify],
   );
 
-  const pendingIds = articles
-    .filter((a) => a.status === "pending")
-    .map((a) => a.id);
-  const isGenerating = activeId !== null;
-  const showProgress = isGenerating && totalQueued > 1;
+  const generatableCount = articles.filter(
+    (a) => (a.status === "pending" || a.status === "error") && !a.queued && !a.generating,
+  ).length;
 
   const setupSteps = [
     setup.embedActive,
@@ -450,29 +449,43 @@ export default function Index() {
       </IndexTable.Cell>
       <IndexTable.Cell>
         <InlineStack gap="100" blockAlign="center" wrap={false}>
-          {statusBadge(article.status, article.reviewedAt, article.errorMessage)}
+          {article.generating ? (
+            <Badge tone="info">Generating…</Badge>
+          ) : article.queued ? (
+            <Badge tone="info">Queued</Badge>
+          ) : (
+            statusBadge(article.status, article.reviewedAt, article.errorMessage)
+          )}
           {article.metaMode ? <Badge tone="magic">Meta</Badge> : null}
           {article.hasWarnings &&
           article.status === "approved" &&
-          !article.reviewedAt ? (
+          !article.reviewedAt &&
+          !article.generating &&
+          !article.queued ? (
             <Badge tone="warning">Review claims</Badge>
           ) : null}
         </InlineStack>
       </IndexTable.Cell>
       <IndexTable.Cell>
         <InlineStack gap="200" blockAlign="center" wrap={false}>
-          {activeId === article.id ? (
+          {article.generating ? (
             <Spinner size="small" accessibilityLabel="Generating" />
           ) : null}
-          {(article.status === "pending" || article.status === "error") && (
-            <Button
-              size="slim"
-              disabled={isGenerating}
-              onClick={() => startGeneration([article.id])}
-            >
-              Generate
-            </Button>
-          )}
+          {(article.status === "pending" || article.status === "error") &&
+            !article.queued &&
+            !article.generating && (
+              <Button
+                size="slim"
+                onClick={() =>
+                  generateFetcher.submit(
+                    { intent: "generate", articleId: article.id },
+                    { method: "POST" },
+                  )
+                }
+              >
+                Generate
+              </Button>
+            )}
           <Button size="slim" url={`/app/articles/${article.id}`}>
             Review
           </Button>
@@ -491,12 +504,15 @@ export default function Index() {
       title="Page Tailor"
       primaryAction={{ content: "Add articles", url: "/app/articles/new" }}
       secondaryActions={
-        pendingIds.length > 1
+        generatableCount > 1
           ? [
               {
-                content: "Generate all pending",
-                disabled: isGenerating,
-                onAction: () => startGeneration(pendingIds),
+                content: `Generate all pending (${generatableCount})`,
+                onAction: () =>
+                  generateFetcher.submit(
+                    { intent: "generateAll" },
+                    { method: "POST" },
+                  ),
               },
             ]
           : undefined
@@ -601,13 +617,15 @@ export default function Index() {
               </Card>
             )}
 
-            {showProgress && (
+            {busyCount > 0 && (
               <InlineStack gap="200" blockAlign="center">
                 <Spinner size="small" accessibilityLabel="Generating variants" />
                 <Text as="span" variant="bodyMd">
-                  Generating {Math.min(doneCount + 1, totalQueued)} of{" "}
-                  {totalQueued}… Each article takes a minute or two — keep this
-                  page open, leaving pauses the remaining articles.
+                  {generatingCount > 0
+                    ? `Generating ${generatingCount} article${generatingCount === 1 ? "" : "s"}${queuedCount > 0 ? `, ${queuedCount} queued` : ""}`
+                    : `${queuedCount} article${queuedCount === 1 ? "" : "s"} queued`}
+                  {" — runs in the background, you can leave this page. New"}
+                  {" variants go live automatically and appear here for review."}
                 </Text>
               </InlineStack>
             )}

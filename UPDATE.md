@@ -14,8 +14,18 @@ setup, use [INSTALL.md](INSTALL.md).
 - The default description selector is now `#persona-description`.
 - The theme embed's default anti-flicker hold list now covers all five
   regions (existing embed installs keep their old value - see step 5).
-- **No database schema changes in this release.** The boot-time
-  `prisma migrate deploy` is a safe no-op.
+- **Background generation queue.** Generate no longer blocks the browser:
+  clicking Generate (or "Generate all pending") queues the work server-side
+  and returns immediately. ALL queued articles generate in parallel (no
+  concurrency cap), and the work continues even if the admin closes the
+  page - the dashboard and review pages poll and update themselves while
+  anything is running. "Generate all pending" now also retries failed
+  articles. Note: very large batches can exceed Anthropic/Shopify API rate
+  limits; calls retry with backoff automatically, and anything that still
+  fails shows as "Failed" with one-click retry.
+- **One additive database migration** (generation queue column) runs
+  automatically on boot via `prisma migrate deploy` - no manual step, no
+  data affected.
 
 ## Update steps
 
@@ -74,8 +84,12 @@ setup, use [INSTALL.md](INSTALL.md).
   (there is no live page to read); the admin-sourced surfaces still generate.
 - Password-protected storefronts: generation fails with a clear error while
   the password is on, because the app cannot read the live page regions.
-- Rollback: redeploy the previous server build; the database is untouched by
-  this release. Variants generated WITH page surfaces stay safe on the old
+- Background queue and hosting: the queue lives in the app's server process.
+  If the host puts idle services to sleep (e.g. free tiers), queued
+  generations pause with the process and resume on the next visit to the
+  app. Use an always-on instance for predictable batch generation.
+- Rollback: redeploy the previous server build; the added column is ignored
+  by older builds and the database needs no changes. Variants generated WITH page surfaces stay safe on the old
   build: the description keeps serving, and the tab-region swaps simply stop
   (fail open - visitors see the original tabs) until the new build is
   redeployed.

@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
-import { useFetcher, useLoaderData, useSubmit } from "@remix-run/react";
+import {
+  useFetcher,
+  useLoaderData,
+  useRevalidator,
+  useSubmit,
+} from "@remix-run/react";
 import {
   Badge,
   Banner,
@@ -32,10 +37,23 @@ import {
 } from "../services/shopify-data.server";
 import {
   buildVariantUrl,
-  generateForArticle,
   isGenerationInFlight,
+  isQueuedFresh,
   sanitizeAdaptedHtml,
 } from "../services/variant.server";
+import {
+  enqueueGeneration,
+  kickGenerationQueue,
+} from "../services/generation-queue.server";
+
+/** Freshly queued or actively generating: the copy is about to change.
+ *  Stale queue entries (dead worker) stop counting so nothing wedges. */
+function isGenerationBusy(article: {
+  generatingAt: Date | null;
+  queuedAt: Date | null;
+}): boolean {
+  return isQueuedFresh(article) || isGenerationInFlight(article);
+}
 
 function parseJsonStringArray(value: string | null): string[] {
   if (!value) return [];
@@ -194,11 +212,14 @@ async function overridesMatchForm(
 const STALE_COPY_ERROR =
   "The adapted copy changed since you loaded this page (a regeneration finished in the background). Review the new copy, then try again.";
 const GENERATING_ERROR =
-  "A generation is running for this article. Wait for it to finish before making changes.";
+  "A generation is queued or running for this article. Wait for it to finish before making changes.";
 
 export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
   const shop = session.shop;
+
+  // Restart recovery for the background generation queue; no-op when idle.
+  kickGenerationQueue();
 
   const article = await prisma.article.findFirst({
     where: { id: params.id, shop },
@@ -253,6 +274,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       wasApproved: article.wasApproved,
       reviewedAt: article.reviewedAt ? article.reviewedAt.toISOString() : null,
       generationInFlight: isGenerationInFlight(article),
+      queued: isQueuedFresh(article),
       updatedAt: article.updatedAt.toISOString(),
     },
     servingEnabled: settings.servingEnabled,
@@ -276,7 +298,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
 };
 
 export const action = async ({ request, params }: ActionFunctionArgs) => {
-  const { admin, session } = await authenticate.admin(request);
+  const { session } = await authenticate.admin(request);
   const shop = session.shop;
 
   const article = await prisma.article.findFirst({
@@ -290,23 +312,17 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   const intent = String(formData.get("intent") ?? "");
 
   if (intent === "generate") {
-    try {
-      await generateForArticle(admin, shop, article.id);
-      return { ok: true, intent, error: null };
-    } catch (error) {
-      // Status "error" + errorMessage are recorded on the row by the service
-      // for real generation failures; lock rejections only need the message.
-      console.error(`Generation failed for article ${article.id}`, error);
-      return {
-        ok: false,
-        intent,
-        error: error instanceof Error ? error.message : "Generation failed.",
-      };
+    // Queued server-side: the response returns immediately and generation
+    // continues in the background even if the admin leaves the page.
+    const { queued } = await enqueueGeneration(shop, [article.id]);
+    if (queued === 0) {
+      return { ok: false, intent, error: "Already generating or queued." };
     }
+    return { ok: true, intent, error: null };
   }
 
   if (intent === "save") {
-    if (isGenerationInFlight(article)) {
+    if (isGenerationBusy(article)) {
       return { ok: false, intent, error: GENERATING_ERROR };
     }
     if (!(await overridesMatchForm(article.id, formData))) {
@@ -343,7 +359,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   if (intent === "markReviewed") {
     // This is the model's only human sign-off: it must refer to exactly the
     // copy the reviewer had on screen, so it carries the same guards as save.
-    if (isGenerationInFlight(article)) {
+    if (isGenerationBusy(article)) {
       return { ok: false, intent, error: GENERATING_ERROR };
     }
     if (!(await overridesMatchForm(article.id, formData))) {
@@ -360,7 +376,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   }
 
   if (intent === "publish") {
-    if (isGenerationInFlight(article)) {
+    if (isGenerationBusy(article)) {
       return { ok: false, intent, error: GENERATING_ERROR };
     }
     const enabledCount = await prisma.override.count({
@@ -385,11 +401,18 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
   }
 
   if (intent === "unapprove") {
-    // A take-offline during a regeneration would be silently reverted by the
-    // generation's success write (which puts the article live) - block it
-    // while the lock is held rather than losing the merchant's intent.
+    // A take-offline during a RUNNING regeneration would be silently
+    // reverted by its success write - block that. A merely QUEUED
+    // regeneration is different: taking offline cancels it (dequeue), which
+    // is exactly what a merchant who just spotted a bad claim wants.
     if (isGenerationInFlight(article)) {
       return { ok: false, intent, error: GENERATING_ERROR };
+    }
+    if (article.queuedAt !== null) {
+      await prisma.article.updateMany({
+        where: { id: article.id, queuedAt: { not: null } },
+        data: { queuedAt: null },
+      });
     }
     const updated = await prisma.article.updateMany({
       where: { id: article.id, status: "approved" },
@@ -446,12 +469,25 @@ export default function ArticleReview() {
   const metaFetcher = useFetcher<typeof action>();
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
 
-  // Generating either from this tab (fetcher in flight) or from anywhere
-  // else (server-side lock reported by the loader).
+  // Busy either from this tab (enqueue request in flight) or from the
+  // server-side queue/lock reported by the loader.
   const isGenerating =
-    generateFetcher.state !== "idle" || article.generationInFlight;
+    generateFetcher.state !== "idle" ||
+    article.generationInFlight ||
+    article.queued;
   const isReviewActing = reviewFetcher.state !== "idle";
   const overrideIds = overrides.map((o) => o.id).join(",");
+  const revalidator = useRevalidator();
+
+  // Poll while the background queue works on this article so the page picks
+  // up the new copy (and the review notice) without a manual refresh.
+  useEffect(() => {
+    if (!article.generationInFlight && !article.queued) return;
+    const timer = setInterval(() => {
+      if (revalidator.state === "idle") revalidator.revalidate();
+    }, 7000);
+    return () => clearInterval(timer);
+  }, [article.generationInFlight, article.queued, revalidator]);
   const isSaving = saveFetcher.state !== "idle";
   const reviewError =
     reviewFetcher.state === "idle" &&
@@ -604,12 +640,20 @@ export default function ArticleReview() {
       <Layout>
         <Layout.Section>
           <BlockStack gap="400">
-            {isGenerating && (
-              <Banner tone="info" title="Generating — this takes a minute or two.">
-                The article is analyzed and the copy adapted in two model
-                passes. Keep this page open.
-              </Banner>
-            )}
+            {isGenerating &&
+              (article.queued && !article.generationInFlight ? (
+                <Banner tone="info" title="Queued for generation">
+                  Starting momentarily. Runs in the background on the server -
+                  you can leave this page; it updates automatically.
+                </Banner>
+              ) : (
+                <Banner tone="info" title="Generating — this takes a minute or two.">
+                  The article is analyzed and the copy adapted in two model
+                  passes, running in the background on the server. You can
+                  leave this page; this article updates automatically when
+                  it's done.
+                </Banner>
+              ))}
             {article.status === "error" && !isGenerating && (
               <Banner tone="critical" title="Generation failed">
                 <BlockStack gap="200">

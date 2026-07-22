@@ -116,12 +116,13 @@ export async function createArticlesForProduct(
  * merchant is then notified to review it post-publication.
  */
 // A crashed run must not lock its article forever.
-const GENERATION_LOCK_STALE_MS = 15 * 60 * 1000;
+export const GENERATION_LOCK_STALE_MS = 15 * 60 * 1000;
 
 export async function generateForArticle(
   admin: AdminClient,
   shop: string,
   articleId: string,
+  options: { lockAlreadyHeld?: boolean } = {},
 ): Promise<void> {
   const article = await prisma.article.findFirst({
     where: { id: articleId, shop },
@@ -130,24 +131,27 @@ export async function generateForArticle(
 
   // In-flight lock: concurrent generations of the same article (second tab,
   // double click, retry while the first is still running) would interleave
-  // their override rewrites and let approval attest copy the reviewer never
+  // their override rewrites and let review sign off copy the reviewer never
   // saw. Status is NOT used as the lock so an approved article keeps serving
-  // untouched while it regenerates.
-  const lock = await prisma.article.updateMany({
-    where: {
-      id: article.id,
-      shop,
-      OR: [
-        { generatingAt: null },
-        { generatingAt: { lt: new Date(Date.now() - GENERATION_LOCK_STALE_MS) } },
-      ],
-    },
-    data: { generatingAt: new Date() },
-  });
-  if (lock.count === 0) {
-    throw new Error(
-      "A generation is already running for this article. Wait for it to finish.",
-    );
+  // untouched while it regenerates. The background queue claims the lock
+  // atomically together with dequeueing and passes lockAlreadyHeld.
+  if (!options.lockAlreadyHeld) {
+    const lock = await prisma.article.updateMany({
+      where: {
+        id: article.id,
+        shop,
+        OR: [
+          { generatingAt: null },
+          { generatingAt: { lt: new Date(Date.now() - GENERATION_LOCK_STALE_MS) } },
+        ],
+      },
+      data: { generatingAt: new Date() },
+    });
+    if (lock.count === 0) {
+      throw new Error(
+        "A generation is already running for this article. Wait for it to finish.",
+      );
+    }
   }
 
   try {
@@ -418,6 +422,20 @@ export function isGenerationInFlight(article: {
   return (
     article.generatingAt !== null &&
     Date.now() - article.generatingAt.getTime() < GENERATION_LOCK_STALE_MS
+  );
+}
+
+// A queue entry that has waited implausibly long (dead worker slot, crashed
+// process without recovery) stops counting as "busy" so the admin UI and
+// action guards never wedge on it; the queue itself still picks it up
+// whenever a slot frees.
+export const QUEUED_STALE_MS = 30 * 60 * 1000;
+
+/** True while the article is freshly queued for background generation. */
+export function isQueuedFresh(article: { queuedAt: Date | null }): boolean {
+  return (
+    article.queuedAt !== null &&
+    Date.now() - article.queuedAt.getTime() < QUEUED_STALE_MS
   );
 }
 

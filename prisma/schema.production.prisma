@@ -99,9 +99,12 @@ model Article {
   status        String     @default("pending") // pending | generated | approved | archived | error
   errorMessage  String?
   // In-flight generation lock: set while a generation runs so concurrent
-  // runs are rejected and approve/save are blocked against copy in motion.
-  // Locks older than 15 minutes are treated as stale (crashed run).
+  // runs are rejected and save/markReviewed are blocked against copy in
+  // motion. Locks older than 15 minutes are treated as stale (crashed run).
   generatingAt  DateTime?
+  // Waiting in the server-side generation queue. Generations run in the
+  // background (several in parallel) and survive the admin closing the page.
+  queuedAt      DateTime?
   // True once the article has ever been live: lets the UI distinguish
   // "taken offline" from "never live".
   wasApproved   Boolean    @default(false)

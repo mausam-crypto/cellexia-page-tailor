@@ -10,7 +10,10 @@ function client(): Anthropic {
       "ANTHROPIC_API_KEY is not set. Add it to your .env before generating variants.",
     );
   }
-  if (!_client) _client = new Anthropic();
+  // Bounded per-call time so a hung request can never outlive the
+  // generation lock's staleness window; two retries with backoff so
+  // rate-limited calls in large uncapped batches mostly self-recover.
+  if (!_client) _client = new Anthropic({ timeout: 4 * 60 * 1000, maxRetries: 2 });
   return _client;
 }
 
