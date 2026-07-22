@@ -1,7 +1,8 @@
 import { randomInt } from "node:crypto";
 import sanitizeHtml from "sanitize-html";
+import { load as loadHtml } from "cheerio";
 import prisma from "../db.server";
-import { fetchArticle } from "./article.server";
+import { fetchArticle, fetchPublicHtml } from "./article.server";
 import {
   analyzeAndAdapt,
   claimGuard,
@@ -11,12 +12,13 @@ import {
 import { getSettings, unsafeSelectorReason } from "./settings.server";
 import {
   getLocalizedSurfaceContent,
+  getPrimaryDomainUrl,
   getProduct,
   getProductHandleForLocale,
   getShopLocales,
   type AdminClient,
 } from "./shopify-data.server";
-import type { VariantPayload } from "./types";
+import type { CopySurface, SurfaceContent, VariantPayload } from "./types";
 
 // Opaque, keyword-free slug for the public URL. Deliberately meaningless so
 // the parameter carries no query intent to crawlers or competitors.
@@ -164,13 +166,25 @@ export async function generateForArticle(
     }
     if (!text) throw new Error("Article has no content to analyze.");
 
+    // Admin-sourced surfaces (description, metafields) come from the Admin
+    // API; live-page surfaces are read from the rendered storefront page.
+    const adminSurfaces = settings.surfaces.filter((s) => s.source !== "page");
+    const pageSurfaces = settings.surfaces.filter(
+      (s) => s.source === "page" && s.enabled && s.selector.trim() !== "",
+    );
+
     const surfaces = await getLocalizedSurfaceContent(
       admin,
       article.productId,
       article.locale,
-      settings.surfaces,
+      adminSurfaces,
       isPrimaryLocale,
     );
+    if (pageSurfaces.length > 0) {
+      surfaces.push(
+        ...(await getPageSurfaceContent(admin, article, primary, pageSurfaces)),
+      );
+    }
     if (surfaces.length === 0) {
       throw new Error(
         "No copy surfaces with content found for this product/locale. Check Settings.",
@@ -322,6 +336,79 @@ export async function generateForArticle(
     });
     throw error;
   }
+}
+
+/**
+ * Original copy for live-page surfaces: fetch the rendered storefront
+ * product page (locale-aware URL) and extract each configured region's
+ * inner HTML - heading and body together, exactly as the visitor sees it,
+ * so the whole container can be adapted and swapped as one unit without
+ * theme changes. Regions that don't exist on the page are skipped, like
+ * empty metafield surfaces.
+ */
+async function getPageSurfaceContent(
+  admin: AdminClient,
+  article: { productId: string; productHandle: string; locale: string },
+  primaryLocale: string,
+  pageSurfaces: CopySurface[],
+): Promise<SurfaceContent[]> {
+  // A draft or unpublished product has no live page: nothing to read, and
+  // nothing these surfaces could ever swap. Skip them so pre-launch variant
+  // prep keeps working on the admin-sourced surfaces.
+  const product = await getProduct(admin, article.productId);
+  if (!product.onlineStoreUrl) return [];
+
+  const primaryDomainUrl = await getPrimaryDomainUrl(admin);
+  const base = primaryDomainUrl.replace(/\/$/, "");
+  const isPrimary =
+    article.locale.toLowerCase() === primaryLocale.toLowerCase();
+  const prefix = isPrimary ? "" : `/${article.locale.toLowerCase()}`;
+  const url = `${base}${prefix}/products/${article.productHandle}`;
+
+  let html: string;
+  try {
+    html = await fetchPublicHtml(url);
+  } catch (error) {
+    // Loud failure: silently generating without the configured tab surfaces
+    // would look like success while leaving the tabs unadapted.
+    throw new Error(
+      `Could not read the live product page (${url}) for the live-page surfaces: ${
+        error instanceof Error ? error.message : String(error)
+      }. Retry, or disable the live-page surfaces in Settings.`,
+    );
+  }
+
+  const $ = loadHtml(html);
+  const result: SurfaceContent[] = [];
+  let matchedRegions = 0;
+  for (const surface of pageSurfaces) {
+    let content = "";
+    try {
+      const el = $(surface.selector).first();
+      if (el.length) {
+        matchedRegions++;
+        const clone = el.clone();
+        clone.find("script, style, noscript").remove();
+        content =
+          surface.mode === "html"
+            ? (clone.html() ?? "").trim()
+            : clone.text().replace(/\s+/g, " ").trim();
+      }
+    } catch {
+      content = "";
+    }
+    if (content) result.push({ surface, content });
+  }
+  // A page with NONE of the configured regions is almost never the right
+  // page: password-protected storefronts and bot interstitials return 200
+  // with a page that matches nothing. Silently generating without every tab
+  // surface would look like success while leaving the tabs unadapted.
+  if (matchedRegions === 0) {
+    throw new Error(
+      `None of the configured live-page regions were found at ${url}. If the store is password-protected, retry after removing the password; if your theme does not have these regions, disable the live-page surfaces in Settings.`,
+    );
+  }
+  return result;
 }
 
 /** True while a non-stale generation lock is held for the article. */

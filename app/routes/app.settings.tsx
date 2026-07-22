@@ -27,6 +27,7 @@ import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import {
   DEFAULT_SURFACES,
+  PAGE_SURFACES,
   getSettings,
   saveSettings,
   surfaceKeyForMetafield,
@@ -90,11 +91,15 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   const existing = new Map(settings.surfaces.map((s) => [s.key, s]));
 
-  // The built-in description surface always comes first; then one row per
-  // product metafield definition (this is where Accentuate fields appear).
+  // The built-in description surface always comes first, then the built-in
+  // live-page regions (theme tab panels), then one row per product metafield
+  // definition (this is where Accentuate fields appear).
   const rows: CopySurface[] = [
     existing.get("description") ?? DEFAULT_SURFACES[0],
   ];
+  for (const pageSurface of PAGE_SURFACES) {
+    rows.push(existing.get(pageSurface.key) ?? pageSurface);
+  }
   for (const def of definitions) {
     const key = surfaceKeyForMetafield(def.namespace, def.key);
     rows.push(
@@ -155,7 +160,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         source:
           r.source === "metafield"
             ? ("metafield" as const)
-            : ("description" as const),
+            : r.source === "page"
+              ? ("page" as const)
+              : ("description" as const),
         namespace: r.namespace ? String(r.namespace) : undefined,
         metafieldKey: r.metafieldKey ? String(r.metafieldKey) : undefined,
         selector: String(r.selector ?? "").trim(),
@@ -182,6 +189,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
 
   for (const s of surfaces) {
     if (!s.enabled) continue;
+    // A live-page region is a whole container swap by definition: plain-text
+    // mode would serve the extracted markup as literal visible text.
+    if (s.source === "page" && s.mode !== "html") {
+      return {
+        ok: false as const,
+        error: `"${s.label || s.key}" is a live page region and must use the HTML swap mode.`,
+      };
+    }
     // An enabled surface without a selector generates copy that can never
     // serve — force an explicit decision instead of a silent no-op.
     if (!s.selector) {
@@ -414,7 +429,9 @@ export default function Settings() {
                           <Text as="span" variant="bodySm" tone="subdued">
                             {row.source === "description"
                               ? "Native product description (body_html)"
-                              : `Metafield ${row.namespace}.${row.metafieldKey}`}
+                              : row.source === "page"
+                                ? "Live page region — original copy is read from the rendered storefront page, so the whole container (heading + body) is adapted together"
+                                : `Metafield ${row.namespace}.${row.metafieldKey}`}
                           </Text>
                         </BlockStack>
                         <Checkbox
@@ -451,6 +468,12 @@ export default function Settings() {
                             { label: "Plain text", value: "text" },
                           ]}
                           value={row.mode}
+                          disabled={row.source === "page"}
+                          helpText={
+                            row.source === "page"
+                              ? "Always HTML for live page regions"
+                              : undefined
+                          }
                           onChange={(value) =>
                             updateRow(row.key, {
                               mode: value === "text" ? "text" : "html",

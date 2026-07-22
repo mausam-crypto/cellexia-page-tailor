@@ -1,7 +1,10 @@
 // A "copy surface" is one piece of product-page copy the app is allowed to
-// adapt: the native product description, or a metafield (e.g. an Accentuate
-// Custom Fields field such as a long description or science section).
-export type SurfaceSource = "description" | "metafield";
+// adapt: the native product description, a metafield (e.g. an Accentuate
+// Custom Fields field), or a live page region ("page") whose original copy
+// is read directly from the rendered storefront page - used for theme tab
+// panels (Overview/Benefits/Science) where heading and body live in one
+// container and must be adapted together.
+export type SurfaceSource = "description" | "metafield" | "page";
 
 export type AdaptationDepth = "light" | "medium" | "deep";
 

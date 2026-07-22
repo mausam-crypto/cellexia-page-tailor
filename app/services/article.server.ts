@@ -80,6 +80,16 @@ async function assertPublicHost(parsed: URL): Promise<void> {
  * admin UI surfaces on the article row.
  */
 export async function fetchArticle(url: string): Promise<ExtractedArticle> {
+  return extractArticle(await fetchPublicHtml(url));
+}
+
+/**
+ * Guarded fetch of a public HTML page (also used to read live storefront
+ * page regions for "page" copy surfaces). Same protections as article
+ * fetching: public-host checks on every redirect hop, timeout, capped
+ * download, charset-aware decoding.
+ */
+export async function fetchPublicHtml(url: string): Promise<string> {
   let current: URL;
   try {
     current = new URL(url);
@@ -129,7 +139,7 @@ export async function fetchArticle(url: string): Promise<ExtractedArticle> {
     clearTimeout(timer);
   }
 
-  return extractArticle(html);
+  return html;
 }
 
 /**

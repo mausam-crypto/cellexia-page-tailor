@@ -51,6 +51,15 @@ automatically, and prompts you to install the app on the store. Approve the
 scope grant (`read_products`, `read_translations`, `read_locales`,
 `read_orders` — all read-only; the app never writes to the store).
 
+> **The admin UI only loads while `npm run dev` is running** (in development
+> the app URL points at the CLI tunnel). If the app is opened in the Admin
+> when no server is reachable — or after a deploy that pushed no valid
+> `application_url` — Shopify shows **"Find this app in the pages where you
+> work"** instead of the app. That message means "no app home is registered",
+> not that the install failed. Fix: run `npm run dev` (development) or
+> complete section 4 steps 1–4 **in order** (production), then reopen the
+> app from Apps.
+
 ## 2. One-time store configuration
 
 1. **Theme embed:** Online Store → Themes → Customize → App embeds → enable
@@ -84,9 +93,16 @@ scope grant (`read_products`, `read_translations`, `read_locales`,
 The app is a standard Remix server. A `Dockerfile` is included; any Node host
 works.
 
+**Do these steps in this order.** In particular, do not run `npm run deploy`
+before step 3: deploying while `application_url` is missing or still the
+placeholder registers the app without a working admin UI ("Find this app in
+the pages where you work").
+
 1. **Host the server** with these environment variables:
-   - `SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET` (from the Partner dashboard →
-     the app → Client credentials)
+   - `SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET` — no dashboard needed: run
+     `npm run shopify -- app env show` in the project to print them (they
+     are also visible in the Dev/Partner dashboard under the app's client
+     credentials, for whoever created the app)
    - `SHOPIFY_APP_URL` = `https://<your-host>`
    - `SCOPES=read_products,read_translations,read_locales,read_orders`
    - `ANTHROPIC_API_KEY` (and optionally `PAGE_TAILOR_MODEL`)
@@ -96,8 +112,10 @@ works.
    migrations. On boot run `npm run setup` (prisma generate + migrate deploy)
    — the Docker start command already does.
 3. **Update `shopify.app.toml`:** set `application_url` to
-   `https://<your-host>` and `[app_proxy] url` to `https://<your-host>/proxy`
-   (deploy pushes what is in the toml — it does not infer URLs).
+   `https://<your-host>`, `[auth] redirect_urls` to
+   `["https://<your-host>/auth/callback"]`, and `[app_proxy] url` to
+   `https://<your-host>/proxy` (deploy pushes what is in the toml — it does
+   not infer URLs).
 4. **Push config + theme extension:**
 
    ```shell
@@ -124,7 +142,15 @@ works.
 
 ## 6. Troubleshooting
 
-See the table in [docs/setup.md](docs/setup.md) §6. First checks for "nothing
-happens on the storefront": app embed enabled? variant live (not taken offline)? serving
-switch ON? embed `param_name` matches Settings? selector actually matches an
-element?
+**Opening the app shows "Find this app in the pages where you work":** the
+app is registered without an app home. In development, start `npm run dev`
+and reopen the app while it runs (the first `dev` also writes the tunnel URL
+into the app config). In production, complete section 4 steps 1–3, run
+`npm run deploy`, then reopen from Apps. To verify what is registered
+without any dashboard access, run `npm run shopify -- app info` — the app
+URL it reports must be your host, not a placeholder.
+
+For storefront issues see the table in [docs/setup.md](docs/setup.md) §6.
+First checks for "nothing happens on the storefront": app embed enabled?
+variant live (not taken offline)? serving switch ON? embed `param_name`
+matches Settings? selector actually matches an element?

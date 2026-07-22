@@ -3,14 +3,54 @@ import type { CopySurface, ShopSettingsData } from "./types";
 
 export { unsafeSelectorReason } from "./selector-rules";
 
-// Sensible default: adapt only the native product description, mapped to the
-// Dawn-family selector. Merchants add Accentuate surfaces in Settings.
+// Defaults are tuned to the Cellexia theme (persona-* hooks). The
+// description falls back to the Dawn-family class as a second selector
+// would not be expressible, so merchants on other themes adjust in Settings.
 export const DEFAULT_SURFACES: CopySurface[] = [
   {
     key: "description",
     label: "Product description",
     source: "description",
-    selector: ".product__description",
+    selector: "#persona-description",
+    mode: "html",
+    enabled: true,
+  },
+];
+
+// Live page regions: whole theme tab panels (heading + body in one
+// container). Original copy is read from the rendered storefront page at
+// generation time, so the full container can be swapped without any theme
+// change. Pre-filled for the Cellexia theme.
+export const PAGE_SURFACES: CopySurface[] = [
+  {
+    key: "page:tagline",
+    label: "Tagline under product name (live page region)",
+    source: "page",
+    selector: "#persona-tagline",
+    mode: "html",
+    enabled: true,
+  },
+  {
+    key: "page:overview",
+    label: "Overview tab (live page region)",
+    source: "page",
+    selector: ".persona-overview-target",
+    mode: "html",
+    enabled: true,
+  },
+  {
+    key: "page:benefits",
+    label: "Benefits tab (live page region)",
+    source: "page",
+    selector: ".persona-benefits-target",
+    mode: "html",
+    enabled: true,
+  },
+  {
+    key: "page:science",
+    label: "Science tab (live page region)",
+    source: "page",
+    selector: ".persona-science-target",
     mode: "html",
     enabled: true,
   },
@@ -38,6 +78,13 @@ export async function getSettings(shop: string): Promise<ShopSettingsData> {
   }
   if (!Array.isArray(surfaces) || surfaces.length === 0) {
     surfaces = DEFAULT_SURFACES;
+  }
+  // Built-in live-page surfaces exist even for shops whose settings were
+  // saved before the feature shipped: append any that are missing so they
+  // show up in Settings and are picked up by generation and serving.
+  const keys = new Set(surfaces.map((s) => s.key));
+  for (const pageSurface of PAGE_SURFACES) {
+    if (!keys.has(pageSurface.key)) surfaces = [...surfaces, pageSurface];
   }
   return {
     paramName: row.paramName,
