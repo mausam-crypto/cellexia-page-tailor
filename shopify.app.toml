@@ -2,7 +2,7 @@
 
 client_id = "24912e424a44ae220c00e7e2a070273f"
 name = "Cellexia-page-tailor"
-application_url = "https://shopify.dev/apps/default-app-home"
+application_url = "https://cellexia-page-tailor.onrender.com"
 embedded = true
 
 [build]
@@ -25,9 +25,9 @@ api_version = "2026-10"
 scopes = "read_products,read_translations,read_locales,read_orders"
 
 [auth]
-redirect_urls = [ "https://shopify.dev/apps/default-app-home/api/auth" ]
+redirect_urls = [ "https://cellexia-page-tailor.onrender.com/auth/callback" ]
 
 [app_proxy]
-url = "https://example.com/proxy"
+url = "https://cellexia-page-tailor.onrender.com/proxy"
 subpath = "cx"
 prefix = "apps"
