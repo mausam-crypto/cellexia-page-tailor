@@ -3,7 +3,7 @@
 This guide is for updating an already-deployed installation. For first-time
 setup, use [INSTALL.md](INSTALL.md).
 
-## What's new in this update (live-page surfaces)
+## What's new in this update
 
 - Four new built-in copy surfaces whose original copy is read from the
   rendered storefront page itself, so whole theme tab panels (heading + body)
@@ -23,6 +23,20 @@ setup, use [INSTALL.md](INSTALL.md).
   articles. Note: very large batches can exceed Anthropic/Shopify API rate
   limits; calls retry with backoff automatically, and anything that still
   fails shows as "Failed" with one-click retry.
+- **Portuguese (and regionless locales generally) fixed.** The shop
+  publishes "pt" but the storefront runtime reports "pt-PT" to the embed,
+  so Portuguese variants never served. Serving now lets a regionless stored
+  locale cover its regional variants (pt covers pt-PT and pt-BR; regional
+  locales stay exact). The claim-guard heuristics also gained Portuguese
+  patterns, and the copy prompt now pins the original's regional variety
+  (European Portuguese stays European Portuguese).
+- **Filterable link list + CSV export.** The dashboard list can be
+  filtered by product, language, and Meta mode (stackable with the status
+  tabs and search). Rows are selectable; "Export ... to CSV" downloads
+  either the ticked rows or the whole filtered list as a spreadsheet with
+  product, language, article link, variant URL, live state, Meta tag,
+  status, detected query, and creation date. Untrusted text is neutralized
+  against spreadsheet formula injection.
 - **One additive database migration** (generation queue column) runs
   automatically on boot via `prisma migrate deploy` - no manual step, no
   data affected.
@@ -50,7 +64,8 @@ setup, use [INSTALL.md](INSTALL.md).
 
 4. **Redeploy the server** the same way it was first deployed (e.g. push to
    Render). The boot command (`npm run docker-start` / `npm run setup`) runs
-   `prisma generate` + `migrate deploy` automatically - a no-op this release.
+   `prisma generate` + `migrate deploy` automatically - this release applies
+   one additive column; existing data is untouched.
 5. **Push the updated theme extension:**
 
    ```shell
@@ -71,12 +86,18 @@ setup, use [INSTALL.md](INSTALL.md).
 
 1. Open the app → Settings: four "live page region" rows are present,
    pre-filled with the selectors above, enabled, swap mode locked to HTML.
-2. Regenerate one article (Regenerate on its review page). Generation now
-   also fetches the live product page to read the tab regions; the variant
-   goes live automatically with a "Live - review needed" notice.
-3. Open the variant URL: the tagline, description, and the Overview,
+2. Queue two or more articles (Generate on each row, or "Generate all
+   pending"): the response is instant, both show "Generating…" at the same
+   time, and closing the tab does not stop them - reopen the app to see
+   them land as "Live - review needed".
+3. Open a variant URL: the tagline, description, and the Overview,
    Benefits, and Science tabs should all show adapted copy. Remove the
    `?cx=...` parameter and confirm the normal page renders.
+4. Portuguese check: open a live pt variant URL - it must swap now (the
+   pt/pt-PT locale mismatch is fixed server-side; no regeneration needed).
+5. Dashboard: the filter row (product / language / meta mode) appears above
+   the list, rows are tickable, and "Export ... to CSV" downloads a
+   spreadsheet of the filtered or selected links.
 
 ## Behavior notes
 

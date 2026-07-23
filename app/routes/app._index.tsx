@@ -14,14 +14,17 @@ import {
   Card,
   EmptyState,
   IndexTable,
+  InlineGrid,
   InlineStack,
   Layout,
   Page,
+  Select,
   Spinner,
   Tabs,
   Text,
   TextField,
   Tooltip,
+  useIndexResourceState,
 } from "@shopify/polaris";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import prisma from "../db.server";
@@ -141,6 +144,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     },
     articles: articles.map((article) => ({
       id: article.id,
+      productId: article.productId,
       productTitle: article.productTitle,
       locale: article.locale,
       localeName: localeNames.get(article.locale) ?? article.locale,
@@ -150,22 +154,25 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       status: article.status,
       metaMode: article.metaMode,
       reviewedAt: article.reviewedAt ? article.reviewedAt.toISOString() : null,
+      createdAt: article.createdAt.toISOString(),
       queued: isQueuedFresh(article),
       generating: isGenerationInFlight(article),
       errorMessage: article.errorMessage,
       overrideCount: article.overrides.length,
       hasWarnings: article.overrides.some((o) => o.warnings || o.articleClaims),
-      variantUrl:
-        article.status === "approved" && primaryDomainUrl
-          ? buildVariantUrl({
-              primaryDomainUrl,
-              productHandle: article.productHandle,
-              locale: article.locale,
-              primaryLocale,
-              paramName: settings.paramName,
-              variantHandle: article.variantHandle,
-            })
-          : null,
+      // Every article has its unique URL from the moment it is created; the
+      // export lists them all and marks which are currently live. The UI's
+      // Copy URL button still only shows for live rows.
+      variantUrl: primaryDomainUrl
+        ? buildVariantUrl({
+            primaryDomainUrl,
+            productHandle: article.productHandle,
+            locale: article.locale,
+            primaryLocale,
+            paramName: settings.paramName,
+            variantHandle: article.variantHandle,
+          })
+        : null,
     })),
   };
 };
@@ -282,6 +289,101 @@ function SetupStep(props: {
   );
 }
 
+type ArticleRow = {
+  id: string;
+  productId: string;
+  productTitle: string;
+  locale: string;
+  localeName: string;
+  sourceTitle: string | null;
+  sourceUrl: string | null;
+  detectedQuery: string | null;
+  status: string;
+  metaMode: boolean;
+  reviewedAt: string | null;
+  createdAt: string;
+  queued: boolean;
+  generating: boolean;
+  variantUrl: string | null;
+};
+
+/** Plain-text status for the spreadsheet (mirrors the badges). */
+function statusTextFor(article: ArticleRow): string {
+  if (article.generating) return "Generating";
+  if (article.queued) return "Queued";
+  switch (article.status) {
+    case "approved":
+      return article.reviewedAt ? "Live" : "Live - review needed";
+    case "generated":
+      return "Offline";
+    case "pending":
+      return "Not generated";
+    case "error":
+      return "Failed";
+    default:
+      return article.status;
+  }
+}
+
+function csvEscape(value: string | null | undefined): string {
+  const raw = value ?? "";
+  // Neutralize spreadsheet formula injection (CWE-1236): titles and queries
+  // come from scraped third-party pages, and Excel executes cells starting
+  // with = + - @ as formulas. A leading apostrophe forces plain text.
+  const s = /^[=+\-@\t\r]/.test(raw) ? `'${raw}` : raw;
+  return /[",\n;]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function buildLinksCsv(rows: ArticleRow[], servingEnabled: boolean): string {
+  const header = [
+    "Product",
+    "Language",
+    "Article",
+    "Original article URL",
+    "Variant page URL",
+    "Currently live",
+    "Meta mode",
+    "Status",
+    "Detected query",
+    "Created",
+  ];
+  const lines = rows.map((a) =>
+    [
+      a.productTitle,
+      a.localeName,
+      a.sourceTitle ?? (a.sourceUrl ? "" : "Pasted article"),
+      a.sourceUrl ?? "",
+      a.variantUrl ?? "",
+      a.status === "approved"
+        ? servingEnabled
+          ? "Yes"
+          : "No (serving switched off)"
+        : "No",
+      a.metaMode ? "Yes" : "No",
+      statusTextFor(a),
+      a.detectedQuery ?? "",
+      a.createdAt.slice(0, 10),
+    ]
+      .map(csvEscape)
+      .join(","),
+  );
+  // UTF-8 BOM so Excel opens accented product names and non-Latin copy
+  // correctly.
+  return "\uFEFF" + [header.map(csvEscape).join(","), ...lines].join("\n");
+}
+
+function downloadCsv(csv: string): void {
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `page-tailor-links-${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 const STATUS_TABS = [
   { id: "all", content: "All", match: () => true },
   {
@@ -332,6 +434,9 @@ export default function Index() {
 
   const [selectedTab, setSelectedTab] = useState(0);
   const [searchQuery, setSearchQuery] = useState("");
+  const [productFilter, setProductFilter] = useState("all");
+  const [localeFilter, setLocaleFilter] = useState("all");
+  const [metaFilter, setMetaFilter] = useState("all");
   const revalidator = useRevalidator();
 
   const queuedCount = articles.filter((a) => a.queued).length;
@@ -389,9 +494,34 @@ export default function Index() {
   const setupDone = setupSteps.every(Boolean);
   const setupDoneCount = setupSteps.filter(Boolean).length;
 
+  // Filter options are derived from the articles that exist, so the
+  // dropdowns never offer a choice that matches nothing.
+  const productOptions = [
+    { label: "All products", value: "all" },
+    ...[...new Map(articles.map((a) => [a.productId, a.productTitle]))].map(
+      ([value, label]) => ({ label, value }),
+    ),
+  ];
+  const localeOptions = [
+    { label: "All languages", value: "all" },
+    ...[...new Map(articles.map((a) => [a.locale, a.localeName]))].map(
+      ([value, label]) => ({ label: `${label} (${value})`, value }),
+    ),
+  ];
+  const metaOptions = [
+    { label: "Meta + standard", value: "all" },
+    { label: "Meta mode only", value: "meta" },
+    { label: "Standard only", value: "standard" },
+  ];
+
+  // All filters stack: status tab, product, language, meta mode, and search.
   const query = searchQuery.trim().toLowerCase();
   const visibleArticles = articles.filter((article) => {
     if (!STATUS_TABS[selectedTab].match(article)) return false;
+    if (productFilter !== "all" && article.productId !== productFilter) return false;
+    if (localeFilter !== "all" && article.locale !== localeFilter) return false;
+    if (metaFilter === "meta" && !article.metaMode) return false;
+    if (metaFilter === "standard" && article.metaMode) return false;
     if (!query) return true;
     return [
       article.productTitle,
@@ -404,6 +534,36 @@ export default function Index() {
       .toLowerCase()
       .includes(query);
   });
+
+  const {
+    selectedResources,
+    allResourcesSelected,
+    handleSelectionChange,
+    clearSelection,
+  } = useIndexResourceState(visibleArticles);
+
+  // useIndexResourceState never prunes ids when rows are filtered away or
+  // vanish on a polling revalidation, so derive the EFFECTIVE selection
+  // (ticked AND currently visible) once and use it everywhere - counts,
+  // header, and the export-all trigger - or the numbers drift apart and a
+  // stale invisible selection could wedge the export button.
+  const visibleIds = new Set(visibleArticles.map((a) => a.id));
+  const selectedVisible = selectedResources.filter((id) => visibleIds.has(id));
+
+  // Export honors the ticked rows when any are visible under the current
+  // filters, otherwise the whole filtered list.
+  const exportRows =
+    selectedVisible.length > 0
+      ? visibleArticles.filter((a) => selectedVisible.includes(a.id))
+      : visibleArticles;
+  const handleExport = () => {
+    if (exportRows.length === 0) return;
+    downloadCsv(buildLinksCsv(exportRows, servingEnabled));
+    shopify.toast.show(
+      `Exported ${exportRows.length} link${exportRows.length === 1 ? "" : "s"} to CSV`,
+    );
+    clearSelection();
+  };
   const tabs = STATUS_TABS.map((tab) => {
     const count =
       tab.id === "all"
@@ -430,7 +590,12 @@ export default function Index() {
   );
 
   const rows = visibleArticles.map((article, index) => (
-    <IndexTable.Row id={article.id} key={article.id} position={index}>
+    <IndexTable.Row
+      id={article.id}
+      key={article.id}
+      position={index}
+      selected={selectedResources.includes(article.id)}
+    >
       <IndexTable.Cell>
         <Text as="span" variant="bodyMd" fontWeight="semibold">
           {article.productTitle}
@@ -639,21 +804,66 @@ export default function Index() {
                   onSelect={setSelectedTab}
                 >
                   <div style={{ padding: "0.5rem 1rem" }}>
-                    <TextField
-                      label="Search articles"
-                      labelHidden
-                      placeholder="Search by product, article, or query"
-                      value={searchQuery}
-                      onChange={setSearchQuery}
-                      autoComplete="off"
-                      clearButton
-                      onClearButtonClick={() => setSearchQuery("")}
-                    />
+                    <BlockStack gap="200">
+                      <InlineGrid columns={{ xs: 1, md: 4 }} gap="200">
+                        <TextField
+                          label="Search articles"
+                          labelHidden
+                          placeholder="Search by product, article, or query"
+                          value={searchQuery}
+                          onChange={setSearchQuery}
+                          autoComplete="off"
+                          clearButton
+                          onClearButtonClick={() => setSearchQuery("")}
+                        />
+                        <Select
+                          label="Product"
+                          labelHidden
+                          options={productOptions}
+                          value={productFilter}
+                          onChange={setProductFilter}
+                        />
+                        <Select
+                          label="Language"
+                          labelHidden
+                          options={localeOptions}
+                          value={localeFilter}
+                          onChange={setLocaleFilter}
+                        />
+                        <Select
+                          label="Meta mode"
+                          labelHidden
+                          options={metaOptions}
+                          value={metaFilter}
+                          onChange={setMetaFilter}
+                        />
+                      </InlineGrid>
+                      <InlineStack align="space-between" blockAlign="center">
+                        <Text as="span" variant="bodySm" tone="subdued">
+                          {selectedVisible.length > 0
+                            ? `${selectedVisible.length} selected for export`
+                            : `${visibleArticles.length} link${visibleArticles.length === 1 ? "" : "s"} match the current filters`}
+                        </Text>
+                        <Button
+                          size="slim"
+                          disabled={exportRows.length === 0}
+                          onClick={handleExport}
+                        >
+                          {selectedVisible.length > 0
+                            ? `Export selected (${exportRows.length}) to CSV`
+                            : `Export all filtered (${exportRows.length}) to CSV`}
+                        </Button>
+                      </InlineStack>
+                    </BlockStack>
                   </div>
                   <IndexTable
                     resourceName={{ singular: "article", plural: "articles" }}
                     itemCount={visibleArticles.length}
-                    selectable={false}
+                    selectable
+                    selectedItemsCount={
+                      allResourcesSelected ? "All" : selectedVisible.length
+                    }
+                    onSelectionChange={handleSelectionChange}
                     headings={[
                       { title: "Product" },
                       { title: "Language" },

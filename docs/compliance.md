@@ -59,7 +59,7 @@ That constraint is then verified, not trusted:
   professional-endorsement language ("clinically proven", "dermatologist
   tested"), drug-like efficacy words (treat/cure/heal), guarantees, rankings and
   press references, and urgency/scarcity phrasing — in English plus common
-  French/German/Spanish/Italian equivalents.
+  French/German/Spanish/Italian/Portuguese equivalents.
 
 Blocking warnings and article-sourced claims are surfaced prominently in the
 review notification (see the post-publication review section below) and drive

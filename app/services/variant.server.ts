@@ -415,6 +415,25 @@ async function getPageSurfaceContent(
   return result;
 }
 
+/**
+ * A regionless stored locale ("pt") serves every regional variant the
+ * storefront runtime may report for it ("pt-PT", "pt-BR"): shops publish
+ * language-level locales while request.locale.iso_code can carry a region.
+ * Region-specific stored locales stay exact. Depends only on the URL and
+ * the database, so same URL still always means same content.
+ */
+export function servedLocaleMatches(
+  articleLocale: string,
+  requestLocale: string,
+): boolean {
+  const stored = articleLocale.toLowerCase();
+  const requested = requestLocale.toLowerCase();
+  return (
+    stored === requested ||
+    (!stored.includes("-") && requested.startsWith(`${stored}-`))
+  );
+}
+
 /** True while a non-stale generation lock is held for the article. */
 export function isGenerationInFlight(article: {
   generatingAt: Date | null;
@@ -495,7 +514,7 @@ export async function getVariantPayload(
     include: { overrides: true },
   });
   if (!article) return null;
-  if (locale && article.locale.toLowerCase() !== locale.toLowerCase()) {
+  if (locale && !servedLocaleMatches(article.locale, locale)) {
     return null;
   }
 
