@@ -82,6 +82,13 @@ setup, use [INSTALL.md](INSTALL.md).
   reader diagnosis and length decision appear on the review page. Same
   guardrails as the Ultra family (no proof elements, Google-safe, hard
   cap on unstated product facts).
+- **Generation reliability for large runs.** Both model calls (adaptation
+  and claim guard) now stream their responses, and the background queue's
+  per-generation timeout was raised from 12 to 25 minutes (lock staleness
+  15 to 30). Big Ultra custom / Deep persona / Max / V2 runs across all
+  seven surfaces - the ones most likely to fail with a timeout before -
+  now complete instead of dying on the clock. Previously failed rows just
+  need a one-click retry (or "Generate all pending", which includes them).
 - **Database migrations run automatically on boot** via
   `prisma migrate deploy`: additive columns (generation queue, review
   timestamps, per-mode plan storage incl. the new v2 plan) and a

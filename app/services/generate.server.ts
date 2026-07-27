@@ -18,9 +18,9 @@ function client(): Anthropic {
   // Bounded per-call time so a hung request can never outlive the
   // generation lock's staleness window; two retries with backoff so
   // rate-limited calls in large uncapped batches mostly self-recover.
-  // (For the streamed adaptation call this timeout covers connection and
-  // response start only; the queue's 12-minute run timeout bounds the
-  // stream itself.)
+  // (For the streamed adaptation and guard calls this timeout covers
+  // connection and response start only; the queue's 25-minute run timeout
+  // bounds the streams themselves.)
   if (!_client) _client = new Anthropic({ timeout: 4 * 60 * 1000, maxRetries: 2 });
   return _client;
 }
@@ -529,7 +529,7 @@ Adapt every surface above for readers arriving from this article.`;
   // Streamed: a 7-surface generation with thinking can legitimately need
   // more output than a non-streaming call can deliver inside the client's
   // 4-minute HTTP timeout (which only covers time to response headers once
-  // streaming). The queue's 12-minute run timeout remains the hard bound
+  // streaming). The queue's 25-minute run timeout remains the hard bound
   // on a hung generation.
   const response = await client()
     .messages.stream({
@@ -631,7 +631,13 @@ export async function claimGuard(
 
   const userContent = `<article>\n${articleText}\n</article>\n\n${block}`;
 
-  const response = await client().messages.create({
+  // Streamed for the same reason as the adaptation call: a 7-surface
+  // ultra-family run hands the guard a large article plus fourteen copy
+  // blocks, and thinking time counts against the clock - non-streaming
+  // risks the client's 4-minute per-attempt HTTP timeout on exactly the
+  // biggest legitimate runs.
+  const response = await client()
+    .messages.stream({
     model: MODEL,
     max_tokens: 8000,
     thinking: { type: "adaptive" },
@@ -654,7 +660,8 @@ A "claim" is any factual assertion: benefits, results, ingredients, statistics, 
       },
     },
     messages: [{ role: "user", content: userContent }],
-  });
+    })
+    .finalMessage();
 
   const text = extractJsonText(response, "claim guard");
   const parsed = parseModelJson(text, "claim guard") as {

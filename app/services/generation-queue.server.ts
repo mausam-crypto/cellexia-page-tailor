@@ -24,8 +24,11 @@ import {
  */
 
 const SWEEP_INTERVAL_MS = 15_000;
-// A slot may never outlive the generation lock's staleness window.
-const RUN_TIMEOUT_MS = 12 * 60 * 1000;
+// A slot may never outlive the generation lock's staleness window. Sized
+// for the largest legitimate run: a 7-surface ultra-family generation with
+// streamed 32K-token output plus the guard pass plus rate-limit backoff
+// under unlimited parallelism.
+const RUN_TIMEOUT_MS = 25 * 60 * 1000;
 
 type QueueState = {
   inFlight: Set<string>;
@@ -173,7 +176,7 @@ async function runOne(articleId: string, shop: string): Promise<void> {
       work(),
       new Promise<never>((_, reject) => {
         const t = setTimeout(
-          () => reject(new Error("Generation timed out after 12 minutes. Retry.")),
+          () => reject(new Error("Generation timed out after 25 minutes. Retry.")),
           RUN_TIMEOUT_MS,
         );
         if (typeof t.unref === "function") t.unref();

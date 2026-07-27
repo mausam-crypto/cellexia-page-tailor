@@ -135,8 +135,10 @@ export async function createArticlesForProduct(
  * guard, and put the variant live (status "approved", reviewedAt null) - the
  * merchant is then notified to review it post-publication.
  */
-// A crashed run must not lock its article forever.
-export const GENERATION_LOCK_STALE_MS = 15 * 60 * 1000;
+// A crashed run must not lock its article forever. Must stay above the
+// queue's RUN_TIMEOUT_MS so a live slot's lock can never be claimed as
+// stale mid-run.
+export const GENERATION_LOCK_STALE_MS = 30 * 60 * 1000;
 
 export async function generateForArticle(
   admin: AdminClient,
