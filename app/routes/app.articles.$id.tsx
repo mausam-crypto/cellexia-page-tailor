@@ -30,7 +30,13 @@ import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { getSettings } from "../services/settings.server";
 import { refreshFindings } from "../services/generate.server";
-import type { ProofPoint } from "../services/types";
+import type {
+  ConversionPlan,
+  PersonaPriority,
+  ProofPoint,
+  V2Plan,
+  V2PlanItem,
+} from "../services/types";
 import {
   getPrimaryDomainUrl,
   getShopLocales,
@@ -65,6 +71,92 @@ function parseJsonStringArray(value: string | null): string[] {
   }
 }
 
+function parsePersonaPriorities(value: string | null): PersonaPriority[] {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (p): p is { point: unknown; importance: unknown } =>
+          typeof p === "object" && p !== null,
+      )
+      .map((p) => {
+        const importance: PersonaPriority["importance"] =
+          p.importance === "high" || p.importance === "low"
+            ? p.importance
+            : "medium";
+        return { point: String(p.point ?? ""), importance };
+      })
+      .filter((p) => p.point !== "");
+  } catch {
+    return [];
+  }
+}
+
+function parseConversionPlan(value: string | null): ConversionPlan | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const list = (raw: unknown): PersonaPriority[] =>
+      Array.isArray(raw)
+        ? raw
+            .filter(
+              (p): p is { point: unknown; importance: unknown } =>
+                typeof p === "object" && p !== null,
+            )
+            .map((p) => {
+              const importance: PersonaPriority["importance"] =
+                p.importance === "high" || p.importance === "low"
+                  ? p.importance
+                  : "medium";
+              return { point: String(p.point ?? ""), importance };
+            })
+            .filter((p) => p.point !== "")
+        : [];
+    return {
+      readerStage: String(parsed.readerStage ?? ""),
+      desires: list(parsed.desires),
+      objections: list(parsed.objections),
+      criteria: list(parsed.criteria),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseV2Plan(value: string | null): V2Plan | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const list = (raw: unknown): V2PlanItem[] =>
+      Array.isArray(raw)
+        ? raw
+            .filter(
+              (p): p is { point: unknown; detail: unknown } =>
+                typeof p === "object" && p !== null,
+            )
+            .map((p) => ({
+              point: String(p.point ?? ""),
+              detail: String(p.detail ?? ""),
+            }))
+            .filter((p) => p.point !== "")
+        : [];
+    return {
+      readerStage: String(parsed.readerStage ?? ""),
+      compression: String(parsed.compression ?? ""),
+      expectations: list(parsed.expectations),
+      redundancy: list(parsed.redundancy),
+      cededGround: list(parsed.cededGround),
+      gaps: list(parsed.gaps),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function parseProofPoints(value: string | null): ProofPoint[] {
   if (!value) return [];
   try {
@@ -90,7 +182,7 @@ function parseProofPoints(value: string | null): ProofPoint[] {
  * Persist adapted_{id}/enabled_{id} fields from a form submission. HTML-mode
  * content is sanitized at write time and findings are recomputed against the
  * edited text — under the mode the stored copy was GENERATED in
- * (generatedMetaMode), not the live toggle, which only affects the next
+ * (generatedMode), not the live toggle, which only affects the next
  * generation. Post-publication model: edits to a live variant serve
  * immediately (no demotion).
  *
@@ -102,7 +194,7 @@ async function applyOverrideEdits(
   article: {
     id: string;
     sourceText: string | null;
-    generatedMetaMode: boolean;
+    generatedMode: string;
   },
   formData: FormData,
 ): Promise<{ changed: boolean; findingsChanged: boolean; error: string | null }> {
@@ -152,7 +244,7 @@ async function applyOverrideEdits(
           adapted,
           {
             articleText: article.sourceText ?? undefined,
-            metaMode: article.generatedMetaMode,
+            metaMode: article.generatedMode === "meta",
           },
         );
         data.warnings = findings.warnings.length
@@ -270,7 +362,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       sourceUrl: article.sourceUrl,
       sourceTitle: article.sourceTitle,
       detectedQuery: article.detectedQuery,
-      metaMode: article.metaMode,
+      mode: article.mode,
       wasApproved: article.wasApproved,
       reviewedAt: article.reviewedAt ? article.reviewedAt.toISOString() : null,
       generationInFlight: isGenerationInFlight(article),
@@ -281,6 +373,9 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     queryVariants: parseJsonStringArray(article.queryVariants),
     evidence: parseJsonStringArray(article.evidence),
     proofPoints: parseProofPoints(article.proofPoints),
+    personaPriorities: parsePersonaPriorities(article.personaPriorities),
+    conversionPlan: parseConversionPlan(article.conversionPlan),
+    v2Plan: parseV2Plan(article.v2Plan),
     overrides: article.overrides.map((o) => ({
       id: o.id,
       surfaceKey: o.surfaceKey,
@@ -342,14 +437,23 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     };
   }
 
-  if (intent === "toggleMeta") {
-    // Only affects the next generation: the stored (possibly approved) copy
-    // was produced under the previous mode and keeps serving unchanged.
+  if (intent === "setMode") {
+    // Only affects the next generation: the stored (possibly live) copy was
+    // produced under the previous mode and keeps serving unchanged.
+    const requested = String(formData.get("mode") ?? "standard");
+    const nextMode =
+      requested === "meta" ||
+      requested === "ultra" ||
+      requested === "persona" ||
+      requested === "max" ||
+      requested === "v2"
+        ? requested
+        : "standard";
     await prisma.article.update({
       where: { id: article.id },
-      data: { metaMode: !article.metaMode },
+      data: { mode: nextMode },
     });
-    return { ok: true, intent, metaMode: !article.metaMode };
+    return { ok: true, intent, mode: nextMode };
   }
 
   // Post-publication review model: variants go live automatically after
@@ -458,6 +562,9 @@ export default function ArticleReview() {
     queryVariants,
     evidence,
     proofPoints,
+    personaPriorities,
+    conversionPlan,
+    v2Plan,
     overrides,
     variantUrl,
   } = useLoaderData<typeof loader>();
@@ -466,7 +573,7 @@ export default function ArticleReview() {
   const generateFetcher = useFetcher<typeof action>();
   const saveFetcher = useFetcher<typeof action>();
   const reviewFetcher = useFetcher<typeof action>();
-  const metaFetcher = useFetcher<typeof action>();
+  const modeFetcher = useFetcher<typeof action>();
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
 
   // Busy either from this tab (enqueue request in flight) or from the
@@ -554,17 +661,27 @@ export default function ArticleReview() {
 
   useEffect(() => {
     if (
-      metaFetcher.state === "idle" &&
-      metaFetcher.data?.intent === "toggleMeta" &&
-      "metaMode" in metaFetcher.data
+      modeFetcher.state === "idle" &&
+      modeFetcher.data?.intent === "setMode" &&
+      "mode" in modeFetcher.data
     ) {
+      const label =
+        modeFetcher.data.mode === "meta"
+          ? "Meta mode"
+          : modeFetcher.data.mode === "ultra"
+            ? "Ultra custom"
+            : modeFetcher.data.mode === "persona"
+              ? "Ultra deep persona"
+              : modeFetcher.data.mode === "max"
+                ? "Ultra Custom Conversion Max"
+                : modeFetcher.data.mode === "v2"
+                  ? "Ultra Custom V2"
+                  : "Standard";
       shopify.toast.show(
-        metaFetcher.data.metaMode
-          ? "Meta mode on — takes effect when you regenerate"
-          : "Meta mode off — takes effect when you regenerate",
+        `Mode set to ${label} — takes effect when you regenerate`,
       );
     }
-  }, [metaFetcher.state, metaFetcher.data, shopify]);
+  }, [modeFetcher.state, modeFetcher.data, shopify]);
 
   const updateDraft = useCallback(
     (id: string, patch: Partial<{ adapted: string; enabled: boolean }>) => {
@@ -615,16 +732,18 @@ export default function ArticleReview() {
       titleMetadata={
         <InlineStack gap="100">
           {statusBadge(article.status, article.reviewedAt)}
-          {article.metaMode && <Badge tone="magic">Meta mode</Badge>}
+          {article.mode === "meta" && <Badge tone="magic">Meta mode</Badge>}
+          {article.mode === "ultra" && <Badge tone="magic">Ultra custom</Badge>}
+          {article.mode === "persona" && (
+            <Badge tone="magic">Deep persona</Badge>
+          )}
+          {article.mode === "max" && (
+            <Badge tone="magic">Conversion Max</Badge>
+          )}
+          {article.mode === "v2" && <Badge tone="magic">Ultra V2</Badge>}
         </InlineStack>
       }
       secondaryActions={[
-        {
-          content: article.metaMode ? "Meta mode: on" : "Meta mode: off",
-          disabled: isGenerating || metaFetcher.state !== "idle",
-          onAction: () =>
-            metaFetcher.submit({ intent: "toggleMeta" }, { method: "POST" }),
-        },
         {
           content: "Regenerate",
           disabled: isGenerating,
@@ -634,6 +753,36 @@ export default function ArticleReview() {
           content: "Delete",
           destructive: true,
           onAction: () => setDeleteModalOpen(true),
+        },
+      ]}
+      actionGroups={[
+        {
+          title: `Mode: ${article.mode === "meta" ? "Meta" : article.mode === "ultra" ? "Ultra" : article.mode === "persona" ? "Persona" : article.mode === "max" ? "Max" : article.mode === "v2" ? "V2" : "Standard"}`,
+          actions: (
+            ["standard", "meta", "ultra", "persona", "max", "v2"] as const
+          ).map((m) => ({
+            content:
+              m === "standard"
+                ? "Standard"
+                : m === "meta"
+                  ? "Meta mode"
+                  : m === "ultra"
+                    ? "Ultra custom"
+                    : m === "persona"
+                      ? "Ultra deep persona"
+                      : m === "max"
+                        ? "Ultra Custom Conversion Max"
+                        : "Ultra Custom V2",
+            disabled:
+              article.mode === m ||
+              isGenerating ||
+              modeFetcher.state !== "idle",
+            onAction: () =>
+              modeFetcher.submit(
+                { intent: "setMode", mode: m },
+                { method: "POST" },
+              ),
+          })),
         },
       ]}
     >
@@ -828,12 +977,53 @@ export default function ArticleReview() {
               </BlockStack>
             </Card>
 
-            {article.metaMode && article.status === "pending" && (
+            {article.mode === "meta" && article.status === "pending" && (
               <Banner tone="info" title="Meta mode article">
                 Generation will rewrite the page deeply and pull the article's
                 specific proof elements (study wins, rankings, statistics) into
                 the copy. The variant goes live automatically - review the
                 proof elements promptly once it does.
+              </Banner>
+            )}
+            {article.mode === "ultra" && article.status === "pending" && (
+              <Banner tone="info" title="Ultra custom article">
+                Generation will recenter every surface on the article
+                audience's intent and vocabulary, and may remove claims that
+                are irrelevant to that audience - without pulling any study
+                results or rankings. The variant goes live automatically;
+                review it promptly once it does.
+              </Banner>
+            )}
+            {article.mode === "max" && article.status === "pending" && (
+              <Banner tone="info" title="Conversion Max article">
+                Generation will diagnose the arriving reader, build three
+                ranked lists (what they want to hear, their doubts, and the
+                criteria the article taught them to judge by), then sequence
+                the whole page around them - including the FAQ tab - without
+                pulling any study results or rankings. The full plan appears
+                here for review once it goes live.
+              </Banner>
+            )}
+            {article.mode === "persona" && article.status === "pending" && (
+              <Banner tone="info" title="Ultra deep persona article">
+                Generation will identify the product type this article's
+                readers are shopping for, build a ranked list of everything
+                they want to hear, and place the top items in the tagline,
+                description, and overview - the full list appears here for
+                review. No study results or rankings are pulled. The variant
+                goes live automatically; review it promptly.
+              </Banner>
+            )}
+            {article.mode === "v2" && article.status === "pending" && (
+              <Banner tone="info" title="Ultra Custom V2 article">
+                Generation will write the page as the article's sequel: it
+                confirms every expectation the article set (never contradicts
+                one), leads with what the article did not already say,
+                becomes strongest on the dimensions where the article found
+                the alternatives lacking, answers the questions the article
+                left open, and moderately tightens the page for nearly-sold
+                readers. The four inventories appear here for review once it
+                goes live. No study results or rankings are pulled.
               </Banner>
             )}
 
@@ -902,6 +1092,182 @@ export default function ArticleReview() {
                       </BlockStack>
                     ))}
                   </BlockStack>
+                </BlockStack>
+              </Card>
+            )}
+
+            {personaPriorities.length > 0 && (
+              <Card>
+                <BlockStack gap="300">
+                  <Text as="h2" variant="headingMd">
+                    What this audience wants to hear (ranked)
+                  </Text>
+                  <Text as="p" tone="subdued" variant="bodySm">
+                    The generation aimed to cover this list wherever the
+                    original copy or the article supports it: top items
+                    prominently in the tagline, description, and overview,
+                    lower items further down. Items with no grounded support
+                    were skipped rather than invented - check the copy against
+                    this list before marking the variant reviewed.
+                  </Text>
+                  <BlockStack gap="150">
+                    {personaPriorities.map((priority, index) => (
+                      <InlineStack key={index} gap="200" blockAlign="center" wrap={false}>
+                        <Badge
+                          tone={
+                            priority.importance === "high"
+                              ? "critical"
+                              : priority.importance === "medium"
+                                ? "attention"
+                                : undefined
+                          }
+                        >
+                          {priority.importance}
+                        </Badge>
+                        <Text as="span" variant="bodyMd">
+                          {priority.point}
+                        </Text>
+                      </InlineStack>
+                    ))}
+                  </BlockStack>
+                </BlockStack>
+              </Card>
+            )}
+
+            {conversionPlan && (
+              <Card>
+                <BlockStack gap="300">
+                  <Text as="h2" variant="headingMd">
+                    Conversion plan
+                  </Text>
+                  {conversionPlan.readerStage && (
+                    <Text as="p" variant="bodyMd">
+                      <Text as="span" fontWeight="semibold">
+                        Arriving reader:{" "}
+                      </Text>
+                      {conversionPlan.readerStage}
+                    </Text>
+                  )}
+                  <Text as="p" tone="subdued" variant="bodySm">
+                    The generation sequenced the page for this reader and
+                    covered each list wherever the original copy or the
+                    article supports it: top desires lead the tagline,
+                    description, and overview; objections are answered where
+                    they naturally arise; criteria are excelled at in the
+                    page's own wording. Unsupported items were skipped rather
+                    than invented - check the copy against these lists.
+                  </Text>
+                  {(
+                    [
+                      ["What they want to hear", conversionPlan.desires],
+                      ["Their doubts, answered in place", conversionPlan.objections],
+                      ["What they judge by", conversionPlan.criteria],
+                    ] as const
+                  ).map(([title, items]) =>
+                    items.length > 0 ? (
+                      <BlockStack gap="150" key={title}>
+                        <Text as="h3" variant="headingSm" tone="subdued">
+                          {title}
+                        </Text>
+                        {items.map((item, index) => (
+                          <InlineStack
+                            key={index}
+                            gap="200"
+                            blockAlign="center"
+                            wrap={false}
+                          >
+                            <Badge
+                              tone={
+                                item.importance === "high"
+                                  ? "critical"
+                                  : item.importance === "medium"
+                                    ? "attention"
+                                    : undefined
+                              }
+                            >
+                              {item.importance}
+                            </Badge>
+                            <Text as="span" variant="bodyMd">
+                              {item.point}
+                            </Text>
+                          </InlineStack>
+                        ))}
+                      </BlockStack>
+                    ) : null,
+                  )}
+                </BlockStack>
+              </Card>
+            )}
+
+            {v2Plan && (
+              <Card>
+                <BlockStack gap="300">
+                  <Text as="h2" variant="headingMd">
+                    Sequel plan (Ultra Custom V2)
+                  </Text>
+                  {v2Plan.readerStage && (
+                    <Text as="p" variant="bodyMd">
+                      <Text as="span" fontWeight="semibold">
+                        Arriving reader:{" "}
+                      </Text>
+                      {v2Plan.readerStage}
+                    </Text>
+                  )}
+                  {v2Plan.compression && (
+                    <Text as="p" variant="bodyMd">
+                      <Text as="span" fontWeight="semibold">
+                        Length decision:{" "}
+                      </Text>
+                      {v2Plan.compression}
+                    </Text>
+                  )}
+                  <Text as="p" tone="subdued" variant="bodySm">
+                    The generation wrote the page as this article's sequel:
+                    expectations confirmed where the copy or article supports
+                    them (never contradicted, silently left out otherwise),
+                    already-delivered claims compressed or deepened instead
+                    of repeated, ceded-ground themes made load-bearing only
+                    where the copy truthfully supports them, and open
+                    questions answered where grounded. Check the copy against
+                    these lists.
+                  </Text>
+                  {(
+                    [
+                      [
+                        "Expectations the article set",
+                        v2Plan.expectations,
+                      ],
+                      [
+                        "Already covered by the article",
+                        v2Plan.redundancy,
+                      ],
+                      [
+                        "Ground the alternatives ceded",
+                        v2Plan.cededGround,
+                      ],
+                      ["Questions the article left open", v2Plan.gaps],
+                    ] as const
+                  ).map(([title, items]) =>
+                    items.length > 0 ? (
+                      <BlockStack gap="150" key={title}>
+                        <Text as="h3" variant="headingSm" tone="subdued">
+                          {title}
+                        </Text>
+                        {items.map((item, index) => (
+                          <BlockStack gap="050" key={index}>
+                            <Text as="span" variant="bodyMd">
+                              {item.point}
+                            </Text>
+                            {item.detail && (
+                              <Text as="span" variant="bodySm" tone="subdued">
+                                {item.detail}
+                              </Text>
+                            )}
+                          </BlockStack>
+                        ))}
+                      </BlockStack>
+                    ) : null,
+                  )}
                 </BlockStack>
               </Card>
             )}

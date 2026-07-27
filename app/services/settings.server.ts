@@ -54,6 +54,14 @@ export const PAGE_SURFACES: CopySurface[] = [
     mode: "html",
     enabled: true,
   },
+  {
+    key: "page:faqs",
+    label: "FAQs tab (live page region)",
+    source: "page",
+    selector: '.tab[data-id="faqs"] .tab__inner',
+    mode: "html",
+    enabled: true,
+  },
 ];
 
 export function surfaceKeyForMetafield(namespace: string, key: string): string {

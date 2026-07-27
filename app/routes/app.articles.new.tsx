@@ -12,7 +12,6 @@ import {
   BlockStack,
   Button,
   Card,
-  Checkbox,
   Divider,
   InlineStack,
   Layout,
@@ -47,7 +46,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const urlsRaw = String(formData.get("urls") ?? "");
   const pastedTitle = String(formData.get("pastedTitle") ?? "");
   const pastedText = String(formData.get("pastedText") ?? "");
-  const metaMode = String(formData.get("metaMode") ?? "") === "true";
+  const mode = String(formData.get("mode") ?? "standard");
 
   if (!productId) return { error: "Select a product first." };
   if (!locale) return { error: "Select a language." };
@@ -87,7 +86,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       urls,
       pastedTitle,
       pastedText,
-      metaMode,
+      mode,
     });
   } catch (error) {
     return {
@@ -114,7 +113,7 @@ export default function NewArticles() {
   const [urls, setUrls] = useState("");
   const [pastedTitle, setPastedTitle] = useState("");
   const [pastedText, setPastedText] = useState("");
-  const [metaMode, setMetaMode] = useState(false);
+  const [mode, setMode] = useState("standard");
   const [clientError, setClientError] = useState<string | null>(null);
 
   const isSubmitting = navigation.state === "submitting";
@@ -149,11 +148,11 @@ export default function NewArticles() {
         urls,
         pastedTitle,
         pastedText,
-        metaMode: String(metaMode),
+        mode,
       },
       { method: "POST" },
     );
-  }, [product, locale, urls, pastedTitle, pastedText, metaMode, submit]);
+  }, [product, locale, urls, pastedTitle, pastedText, mode, submit]);
 
   const error = clientError ?? actionData?.error;
 
@@ -215,11 +214,37 @@ export default function NewArticles() {
                   placeholder={"https://example.com/top-5-vitamin-c-serums\nhttps://example.com/best-retinol-alternatives"}
                   helpText="Each URL becomes its own article entry with its own variant URL."
                 />
-                <Checkbox
-                  label="Meta mode"
-                  checked={metaMode}
-                  onChange={setMetaMode}
-                  helpText="For articles running as Meta (Facebook/Instagram) campaigns. Rewrites the page much more deeply and pulls the article's specific proof elements — study wins, rankings, statistics — into the copy so the page matches the article exactly. Applies to every article in this batch."
+                <Select
+                  label="Adaptation mode"
+                  options={[
+                    {
+                      label: "Standard — re-emphasize within configured depths",
+                      value: "standard",
+                    },
+                    {
+                      label: "Meta mode — deep rewrite + the article's proof elements",
+                      value: "meta",
+                    },
+                    {
+                      label: "Ultra custom — deepest intent tailoring, no proof elements",
+                      value: "ultra",
+                    },
+                    {
+                      label: "Ultra deep persona — ranked audience desires drive placement",
+                      value: "persona",
+                    },
+                    {
+                      label: "Ultra Custom Conversion Max — desires + objections + criteria",
+                      value: "max",
+                    },
+                    {
+                      label: "Ultra Custom V2 — the page as the article's sequel",
+                      value: "v2",
+                    },
+                  ]}
+                  value={mode}
+                  onChange={setMode}
+                  helpText="Applies to every article in this batch (changeable per article later). Meta mode pulls the article's study wins, rankings, and statistics into the copy — for Meta (Facebook/Instagram) funnels only. Ultra custom recenters the whole page on the article audience's intent and vocabulary (e.g. face creams for men, night creams), may drop claims irrelevant to that audience, and never pulls proof elements. Ultra deep persona goes further: it builds a ranked list of everything that audience wants to hear and places the top items in the tagline, description, and overview. Conversion Max runs three ranked lists (desires, objections, decision criteria), sequences the page for the reader's awareness stage, answers doubts where they arise, quietly excels on the article's evaluation criteria, and tailors the FAQ tab - all organic, no proof elements. Ultra Custom V2 treats the page as the article's sequel: it confirms every expectation the article set, leads with what the article did not already say, is strongest where the article found the alternatives lacking, answers the questions the article left open, and moderately tightens the page for nearly-sold readers."
                 />
                 <Divider />
                 <BlockStack gap="300">

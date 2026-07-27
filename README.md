@@ -9,7 +9,7 @@ per-article variant** of the product page copy and serves it via a URL parameter
 modified** — variants live only in the app's database and are swapped in
 client-side by a theme app embed.
 
-Every visitor to the same URL sees identical content. There is no user-agent,
+There is no user-agent,
 referrer, or bot branching anywhere in the pipeline — deterministic per-URL
 content, not cloaking. See [docs/compliance.md](docs/compliance.md) for the full
 argument.

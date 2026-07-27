@@ -81,8 +81,15 @@ npx prisma migrate deploy
    - **max hold** — the longest time (ms) the embed will keep those regions hidden
      waiting for the payload. On timeout or any error the original copy is shown
      unchanged (fail-open).
+   - **Remember variant (days)** — how long a visitor's browser keeps showing
+     the variant they last opened when they return to the product page without
+     the special link (default 30; 0 turns persistence off).
 
-The embed does nothing at all when the URL has no variant parameter.
+Without a variant parameter, the embed serves the visitor's remembered
+variant if they have one (see "Remember variant" above); visitors with no
+stored preference — including all crawlers — get the untouched base page.
+Append `?cx=off` to a product URL to clear the memory in your own browser
+(useful for QA).
 
 ## 3. Finding CSS selectors for surfaces
 
@@ -219,6 +226,7 @@ Honestly:
 | Variant not showing | Variant taken offline | Only live variants are served; put it back live on the article page |
 | Variant not showing | Locale mismatch | The URL's locale prefix must match the article's language |
 | Variant not showing | Param name mismatch | Embed `param_name` must equal Settings -> URL parameter name |
+| Variant shows on the CLEAN url while testing | Browser-stored preference from an earlier variant visit | Append `?cx=off` and reload, or use a private window |
 | Flash of original copy | Payload arrives after first paint | Add the surface selectors to `hide_selectors` and/or raise **max hold** |
 | Generation error: "ANTHROPIC_API_KEY is not set" | Missing env var | Add the key to `.env` and restart |
 | Generation error: fetch failed / could not extract text | Article host blocks bots or renders client-side | Open the article, copy its text, and use the paste-content option instead of the URL |

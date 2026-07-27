@@ -2,16 +2,20 @@
 <script>
 /* Page Tailor — variant copy swapper.
    ABSOLUTE RULES: no user-agent or bot detection of any kind, no referrer
-   logic, no random sampling — the same URL must render the same content for
-   every visitor. Never touches canonical tags, JSON-LD, price, or any element
-   outside the configured ops selectors. Every failure falls open to the
-   normal page. */
+   logic, no random sampling. The server is deterministic per variant code;
+   the ONLY visitor-dependent behavior is the visitor's own browser-stored
+   variant preference below, applied by identical logic for everyone —
+   anyone without a stored code (every crawler, every fresh visitor) gets
+   the base page on clean URLs. Never touches canonical tags, JSON-LD,
+   price, or any element outside the configured ops selectors. Every
+   failure falls open to the normal page. */
 (function () {
   try {
     var PARAM = {{ block.settings.param_name | json }};
     var PROXY = {{ block.settings.proxy_path | json }};
     var HIDE = {{ block.settings.hide_selectors | json }};
     var MAX_HOLD = {{ block.settings.max_hide_ms | json }};
+    var PERSIST_DAYS = {{ block.settings.persist_days | default: 30 | json }};
     var LOCALE = {{ request.locale.iso_code | json }};
 
     /* Handles may be percent-encoded non-ASCII (CJK etc.). */
@@ -22,14 +26,64 @@
 
     /* "variant" is Shopify's own product-option param — never hijack it. */
     var paramOk = PARAM && PARAM !== 'variant' && /^[a-z0-9_]{1,12}$/.test(PARAM);
-    var handle = paramOk ? new URLSearchParams(location.search).get(PARAM) : null;
-    if (handle && !/^[a-z0-9]{4,16}$/.test(handle)) handle = null;
+    var rawParam = paramOk ? new URLSearchParams(location.search).get(PARAM) : null;
+    var urlHandle = rawParam && /^[a-z0-9]{4,16}$/.test(rawParam) ? rawParam : null;
+
+    /* Persistence: remember which variant this visitor last opened for this
+       product+language, so the tailored page survives normal navigation and
+       return visits. Lives only in the visitor's own browser; overwritten by
+       a newer variant link (last click wins), cleared by ?<param>=off, and
+       expires after PERSIST_DAYS. No crawler/user-agent logic anywhere: a
+       visitor (or crawler) without a stored preference always gets the base
+       page on clean URLs. Every failure falls back to no-memory behavior. */
+    var memKey = 'ptv:' + product + ':' + LOCALE;
+    var persistMs = (Number(PERSIST_DAYS) > 0 ? Number(PERSIST_DAYS) : 0) * 86400000;
+    function readMemory() {
+      if (!persistMs) return null;
+      try {
+        var raw = localStorage.getItem(memKey);
+        if (!raw) return null;
+        var obj = JSON.parse(raw);
+        if (!obj || typeof obj.h !== 'string' || !/^[a-z0-9]{4,16}$/.test(obj.h) ||
+            typeof obj.t !== 'number' || (Date.now() - obj.t) > persistMs) {
+          try { localStorage.removeItem(memKey); } catch (e) {}
+          return null;
+        }
+        return obj.h;
+      } catch (e) { return null; }
+    }
+    function writeMemory(h) {
+      if (!persistMs) return;
+      try { localStorage.setItem(memKey, JSON.stringify({ h: h, t: Date.now() })); } catch (e) {}
+    }
+
+    /* Memory WRITES (store/clear) wait for prerender activation, mirroring
+       the beacon: a speculative page the visitor never opens must not
+       overwrite or erase their stored preference. Resolution for the
+       current render (reads) happens immediately either way. */
+    var mutateMemory = function () {
+      try {
+        if (rawParam === 'off') { localStorage.removeItem(memKey); }
+        else if (urlHandle) { writeMemory(urlHandle); }
+      } catch (e) {}
+    };
+    if (typeof document.prerendering !== 'undefined' && document.prerendering) {
+      document.addEventListener('prerenderingchange', mutateMemory, { once: true });
+    } else {
+      mutateMemory();
+    }
+    var handle = urlHandle;
+    if (!handle && rawParam !== 'off') {
+      handle = readMemory();
+    }
 
     /* Anonymous page-view beacon for the experiment tracker: product handle,
-       language, and whether this visit ARRIVED VIA a variant URL (regardless
-       of whether the swap later succeeds). Fired identically for every
-       visitor — no IDs, no cookies, fire-and-forget. Skipped in the theme
-       editor and during prerendering so counts reflect real visits. */
+       language, and whether this visit carries variant context — from the
+       URL or from the visitor's stored preference — regardless of whether
+       the swap later succeeds. The beacon logic is identical for every
+       visitor; no IDs are sent and nothing per-visitor is stored server
+       side. Skipped in the theme editor and during prerendering so counts
+       reflect real visits. */
     try {
       var editing = window.Shopify && window.Shopify.designMode;
       var prerendering = typeof document.prerendering !== 'undefined' && document.prerendering;
@@ -128,10 +182,36 @@
       } catch (e) {}
     }
 
+    /* Themes bind accordion buttons directly at page load; nodes we swap in
+       lose those handlers, which would leave FAQ questions un-clickable.
+       Delegated re-binding on the swapped container keeps them working.
+       No-op for regions without accordion markup; every step fails open. */
+    function reviveAccordions(root) {
+      try {
+        if (!root || !root.querySelector || root.__ptAcc) return;
+        if (!root.querySelector('.accordion__group')) return;
+        root.__ptAcc = 1;
+        root.addEventListener('click', function (ev) {
+          try {
+            var t = ev.target;
+            var btn = t && t.closest ? t.closest('.accordion__group button') : null;
+            if (!btn || !root.contains(btn)) return;
+            ev.preventDefault();
+            var group = btn.closest('.accordion__group');
+            if (!group) return;
+            var open = group.classList.toggle('active');
+            var copy = group.querySelector('.accordion__copy');
+            if (copy) copy.style.display = open ? 'block' : 'none';
+          } catch (e) {}
+        });
+      } catch (e) {}
+    }
+
     var payload = null;
     function apply() {
       if (!payload || !payload.ops || !payload.ops.length) { release(); return; }
       var swapped = 0;
+      var swappedRoots = [];
       for (var i = 0; i < payload.ops.length; i++) {
         /* Per-op try/catch: one malformed selector must not abort the rest. */
         try {
@@ -142,9 +222,13 @@
             if (op.mode === 'html') els[j].innerHTML = op.content;
             else els[j].textContent = op.content;
             swapped++;
+            if (op.mode === 'html') swappedRoots.push(els[j]);
           }
         } catch (e) {}
       }
+      try {
+        for (var r = 0; r < swappedRoots.length; r++) reviveAccordions(swappedRoots[r]);
+      } catch (e) {}
       /* Only mark applied when something actually swapped, so "served but
          zero selectors matched" is distinguishable when debugging a theme. */
       try { if (swapped > 0) document.documentElement.dataset.ptApplied = '1'; } catch (e) {}
@@ -222,7 +306,7 @@
       "type": "textarea",
       "id": "hide_selectors",
       "label": "Selectors to hold during swap",
-      "default": "#persona-tagline,#persona-description,.persona-overview-target,.persona-benefits-target,.persona-science-target",
+      "default": "#persona-tagline,#persona-description,.persona-overview-target,.persona-benefits-target,.persona-science-target,.tab[data-id=\"faqs\"] .tab__inner",
       "info": "Comma-separated CSS selectors briefly hidden to avoid a flash of the original copy. Must match the surface selectors in the app's Settings. Only list the copy regions the app adapts — never price, buy buttons, or reviews."
     },
     {
@@ -233,6 +317,16 @@
       "max": 2000,
       "step": 100,
       "default": 800
+    },
+    {
+      "type": "range",
+      "id": "persist_days",
+      "label": "Remember variant (days)",
+      "min": 0,
+      "max": 90,
+      "step": 1,
+      "default": 30,
+      "info": "Returning visitors keep seeing the variant they last opened, for this many days, when they revisit the product page without the special link. 0 turns persistence off. Append ?cx=off to a product URL to reset your own browser (useful for QA)."
     }
   ]
 }

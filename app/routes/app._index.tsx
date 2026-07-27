@@ -152,7 +152,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       sourceUrl: article.sourceUrl,
       detectedQuery: article.detectedQuery,
       status: article.status,
-      metaMode: article.metaMode,
+      mode: article.mode,
       reviewedAt: article.reviewedAt ? article.reviewedAt.toISOString() : null,
       createdAt: article.createdAt.toISOString(),
       queued: isQueuedFresh(article),
@@ -299,7 +299,7 @@ type ArticleRow = {
   sourceUrl: string | null;
   detectedQuery: string | null;
   status: string;
-  metaMode: boolean;
+  mode: string;
   reviewedAt: string | null;
   createdAt: string;
   queued: boolean;
@@ -342,7 +342,7 @@ function buildLinksCsv(rows: ArticleRow[], servingEnabled: boolean): string {
     "Original article URL",
     "Variant page URL",
     "Currently live",
-    "Meta mode",
+    "Mode",
     "Status",
     "Detected query",
     "Created",
@@ -359,7 +359,17 @@ function buildLinksCsv(rows: ArticleRow[], servingEnabled: boolean): string {
           ? "Yes"
           : "No (serving switched off)"
         : "No",
-      a.metaMode ? "Yes" : "No",
+      a.mode === "meta"
+        ? "Meta"
+        : a.mode === "ultra"
+          ? "Ultra custom"
+          : a.mode === "persona"
+            ? "Ultra deep persona"
+            : a.mode === "max"
+              ? "Conversion Max"
+              : a.mode === "v2"
+                ? "Ultra Custom V2"
+                : "Standard",
       statusTextFor(a),
       a.detectedQuery ?? "",
       a.createdAt.slice(0, 10),
@@ -436,7 +446,7 @@ export default function Index() {
   const [searchQuery, setSearchQuery] = useState("");
   const [productFilter, setProductFilter] = useState("all");
   const [localeFilter, setLocaleFilter] = useState("all");
-  const [metaFilter, setMetaFilter] = useState("all");
+  const [modeFilter, setModeFilter] = useState("all");
   const revalidator = useRevalidator();
 
   const queuedCount = articles.filter((a) => a.queued).length;
@@ -508,10 +518,14 @@ export default function Index() {
       ([value, label]) => ({ label: `${label} (${value})`, value }),
     ),
   ];
-  const metaOptions = [
-    { label: "Meta + standard", value: "all" },
-    { label: "Meta mode only", value: "meta" },
+  const modeOptions = [
+    { label: "All modes", value: "all" },
     { label: "Standard only", value: "standard" },
+    { label: "Meta mode only", value: "meta" },
+    { label: "Ultra custom only", value: "ultra" },
+    { label: "Ultra deep persona only", value: "persona" },
+    { label: "Conversion Max only", value: "max" },
+    { label: "Ultra Custom V2 only", value: "v2" },
   ];
 
   // All filters stack: status tab, product, language, meta mode, and search.
@@ -520,8 +534,7 @@ export default function Index() {
     if (!STATUS_TABS[selectedTab].match(article)) return false;
     if (productFilter !== "all" && article.productId !== productFilter) return false;
     if (localeFilter !== "all" && article.locale !== localeFilter) return false;
-    if (metaFilter === "meta" && !article.metaMode) return false;
-    if (metaFilter === "standard" && article.metaMode) return false;
+    if (modeFilter !== "all" && article.mode !== modeFilter) return false;
     if (!query) return true;
     return [
       article.productTitle,
@@ -621,7 +634,13 @@ export default function Index() {
           ) : (
             statusBadge(article.status, article.reviewedAt, article.errorMessage)
           )}
-          {article.metaMode ? <Badge tone="magic">Meta</Badge> : null}
+          {article.mode === "meta" ? <Badge tone="magic">Meta</Badge> : null}
+          {article.mode === "ultra" ? <Badge tone="magic">Ultra</Badge> : null}
+          {article.mode === "persona" ? (
+            <Badge tone="magic">Persona</Badge>
+          ) : null}
+          {article.mode === "max" ? <Badge tone="magic">Max</Badge> : null}
+          {article.mode === "v2" ? <Badge tone="magic">V2</Badge> : null}
           {article.hasWarnings &&
           article.status === "approved" &&
           !article.reviewedAt &&
@@ -831,11 +850,11 @@ export default function Index() {
                           onChange={setLocaleFilter}
                         />
                         <Select
-                          label="Meta mode"
+                          label="Adaptation mode"
                           labelHidden
-                          options={metaOptions}
-                          value={metaFilter}
-                          onChange={setMetaFilter}
+                          options={modeOptions}
+                          value={modeFilter}
+                          onChange={setModeFilter}
                         />
                       </InlineGrid>
                       <InlineStack align="space-between" blockAlign="center">

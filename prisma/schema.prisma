@@ -28,8 +28,9 @@ model ShopSettings {
 }
 
 // One row per (day, product, locale): storefront page views recorded by the
-// theme embed's beacon. variantViews counts views that ARRIVED via a variant
-// URL (a well-formed ?cx value) — it does not verify that a variant was
+// theme embed's beacon. variantViews counts views with variant CONTEXT: an
+// arrival via a well-formed ?cx value OR a return visit carried by the
+// visitor's browser-stored preference. It does not verify that a variant was
 // served or applied, so it keeps counting while serving is switched off.
 model DailyStat {
   id            String @id @default(cuid())
@@ -115,15 +116,23 @@ model Article {
   // immediately and resets reviewedAt to null; the merchant is notified and
   // marks it reviewed (or takes it offline). Null = live awaiting review.
   reviewedAt    DateTime?
-  // Meta mode: set per URL batch at creation. Generation rewrites much more
-  // aggressively and pulls the article's specific proof elements (study wins,
-  // rankings, statistics) into the copy. Takes effect at generation time.
-  metaMode      Boolean    @default(false)
-  // Snapshot of metaMode at last generation: edit-time finding
-  // reclassification must follow the mode the stored copy was generated
-  // under, not the live toggle (which only affects the next generation).
-  generatedMetaMode Boolean @default(false)
+  // Adaptation mode, set per URL batch at creation (flippable per article;
+  // takes effect at generation): standard | meta | ultra | persona | max | v2.
+  // meta pulls the article's proof elements (study wins, rankings, stats);
+  // ultra rewrites deepest for the article's audience intent/use case, may
+  // remove irrelevant claims, but never pulls proof elements; persona is
+  // ultra plus a ranked audience-desire list driving placement; v2 writes
+  // the page as the article's sequel (expectations/redundancy/ceded
+  // ground/gaps inventories with moderate stage-matched compression).
+  mode          String     @default("standard")
+  // Snapshot of mode at last generation: edit-time finding reclassification
+  // must follow the mode the stored copy was generated under, not the live
+  // toggle (which only affects the next generation).
+  generatedMode String     @default("standard")
   proofPoints   String? // JSON [{claim, quote, verified}]: article proof elements used in meta mode
+  personaPriorities String? // JSON [{point, importance}]: deep-persona ranked desire list
+  conversionPlan    String? // JSON ConversionPlan: conversion-max reader stage + 3 ranked lists
+  v2Plan            String? // JSON V2Plan: Ultra Custom V2 inventories + reader stage + length decision
   variantHandle String     @unique // opaque slug used in the public URL
   overrides     Override[]
   createdAt     DateTime   @default(now())

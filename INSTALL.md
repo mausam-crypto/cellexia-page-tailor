@@ -84,8 +84,10 @@ scope grant (`read_products`, `read_translations`, `read_locales`,
    flagged claims, then click **Mark as reviewed** (the badge flips to
    "Live"). Also verify **Take offline** works and "Put live" restores it.
 4. Open the variant URL shown on the article page — the mapped copy regions
-   should swap. Remove the `?cx=...` parameter — the page must render the
-   normal copy. Turn serving OFF — within ~2–4 minutes the variant URL must
+   should swap. Because of visitor persistence, the SAME browser keeps
+   showing the variant on the clean URL: use a fresh private window (or
+   append `?cx=off`) to confirm the clean URL renders normal copy for new
+   visitors. Turn serving OFF — within ~2–4 minutes the variant URL must
    render normal copy again.
 
 ## 4. Production deployment
@@ -128,8 +130,10 @@ the pages where you work").
 ## 5. Things to know before touching the code
 
 - **Never add user-agent, referrer, bot, or randomized branching** to the
-  theme embed or proxy routes. Same URL → same content for every visitor is
-  the app's core compliance guarantee ([docs/compliance.md](docs/compliance.md)).
+  theme embed or proxy routes. The server is strictly deterministic (same
+  variant code → same content); the only visitor-dependent behavior is the
+  browser-stored variant preference, applied by identical logic for
+  everyone ([docs/compliance.md](docs/compliance.md)).
 - The serving switch, the generation lock, and the review-state guards are
   enforced **server-side**; the experiment early-stop thresholds live in
   `app/services/stats.server.ts`. Don't weaken them casually.

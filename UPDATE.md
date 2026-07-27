@@ -12,8 +12,9 @@ setup, use [INSTALL.md](INSTALL.md).
   Benefits (`.persona-benefits-target`), Science (`.persona-science-target`).
   They appear in the app's Settings automatically, pre-filled and enabled.
 - The default description selector is now `#persona-description`.
-- The theme embed's default anti-flicker hold list now covers all five
-  regions (existing embed installs keep their old value - see step 5).
+- The theme embed's default anti-flicker hold list now covers all six
+  regions, including the new FAQs tab (existing embed installs keep their
+  old value - see step 5).
 - **Background generation queue.** Generate no longer blocks the browser:
   clicking Generate (or "Generate all pending") queues the work server-side
   and returns immediately. ALL queued articles generate in parallel (no
@@ -37,9 +38,55 @@ setup, use [INSTALL.md](INSTALL.md).
   product, language, article link, variant URL, live state, Meta tag,
   status, detected query, and creation date. Untrusted text is neutralized
   against spreadsheet formula injection.
-- **One additive database migration** (generation queue column) runs
-  automatically on boot via `prisma migrate deploy` - no manual step, no
-  data affected.
+- **Variant persistence for returning visitors.** A visitor who opens a
+  variant link keeps seeing that variant when they come back to the product
+  page without the link - remembered in their own browser per product and
+  language, 30 days by default (configurable via the new "Remember variant
+  (days)" theme embed setting; 0 disables), last-click-wins, reset with
+  ?cx=off. Server untouched: crawlers and fresh visitors always get the
+  base page on clean URLs, and take-offline/kill-switch still win within
+  minutes. docs/compliance.md documents the posture change.
+- **New "Ultra custom" adaptation mode** (third mode alongside Standard and
+  Meta). Deepest intent tailoring: recenters the tagline, description,
+  overview, benefits, and science copy on the article audience's intent and
+  vocabulary (e.g. "face creams for men", "night creams"), may remove
+  claims irrelevant to that audience, and never pulls study results or
+  rankings - safe for Google Ads funnels. Chosen per batch on Add Articles
+  (now a three-option mode selector) and changeable per article from the
+  review page's Mode menu. Dashboard filter and CSV export show the mode.
+- **New "Ultra deep persona" adaptation mode** (fourth mode): a variant of
+  Ultra custom that first identifies the product type the article's readers
+  are shopping for, builds a ranked list of everything they want to hear,
+  and places items by importance - the top 1-3 lead the tagline,
+  description, and overview. The ranked list is stored and shown on the
+  review page so you can check placement. Same guardrails as Ultra custom
+  (no proof elements, Google-safe, claim grounding, removal backstops).
+- **New "Ultra Custom Conversion Max" adaptation mode** (fifth mode): reader
+  awareness diagnosis plus three ranked lists (desires, objections, decision
+  criteria) drive sequencing, in-place objection handling, organic
+  criteria-excellence (reworded, never article-referencing), and FAQ tab
+  tailoring. The full plan shows on the review page. Includes a new FAQs
+  live-page surface (.tab[data-id="faqs"] .tab__inner, pre-filled) and an
+  embed upgrade that keeps swapped FAQ accordions clickable (the theme's
+  direct-bound handlers do not survive swaps; the embed re-binds them).
+  Generation output budget raised for the larger surface set.
+- **New "Ultra Custom V2" adaptation mode** (sixth mode): writes the page
+  as the article's sequel. Four article-derived inventories drive the
+  rewrite - expectations the article set (confirmed, never contradicted),
+  claims the article already delivered (compressed or deepened, not
+  repeated), ground the article's alternatives ceded (the page becomes
+  strongest exactly there, without ever naming or comparing), and buying
+  questions the article left open (answered where grounded) - plus
+  moderate stage-matched length trimming (up to ~25% for nearly-sold
+  readers, irrelevant content first). All four inventories plus the
+  reader diagnosis and length decision appear on the review page. Same
+  guardrails as the Ultra family (no proof elements, Google-safe, hard
+  cap on unstated product facts).
+- **Database migrations run automatically on boot** via
+  `prisma migrate deploy`: additive columns (generation queue, review
+  timestamps, per-mode plan storage incl. the new v2 plan) and a
+  mode-column conversion that preserves existing Meta-mode articles. No
+  data is lost and no manual step is needed.
 
 ## Update steps
 
@@ -76,7 +123,7 @@ setup, use [INSTALL.md](INSTALL.md).
    the **"Selectors to hold during swap"** field by hand to:
 
    ```text
-   #persona-tagline,#persona-description,.persona-overview-target,.persona-benefits-target,.persona-science-target
+   #persona-tagline,#persona-description,.persona-overview-target,.persona-benefits-target,.persona-science-target,.tab[data-id="faqs"] .tab__inner
    ```
 
    (Schema defaults only apply to fresh embed installs; existing installs
@@ -84,20 +131,28 @@ setup, use [INSTALL.md](INSTALL.md).
 
 ## Post-update verification
 
-1. Open the app → Settings: four "live page region" rows are present,
-   pre-filled with the selectors above, enabled, swap mode locked to HTML.
+1. Open the app → Settings: five "live page region" rows are present
+   (tagline, Overview, Benefits, Science, FAQs), pre-filled, enabled, swap
+   mode locked to HTML.
 2. Queue two or more articles (Generate on each row, or "Generate all
    pending"): the response is instant, both show "Generating…" at the same
    time, and closing the tab does not stop them - reopen the app to see
    them land as "Live - review needed".
 3. Open a variant URL: the tagline, description, and the Overview,
-   Benefits, and Science tabs should all show adapted copy. Remove the
-   `?cx=...` parameter and confirm the normal page renders.
+   Benefits, and Science tabs should all show adapted copy. For a
+   Conversion Max variant, also open the FAQs tab: the questions reflect
+   the adapted set and every question still opens and closes on click. In
+   a FRESH private/incognito window, open the clean product URL (no
+   parameter) and confirm the normal page renders - fresh visitors and
+   crawlers always get the base page.
 4. Portuguese check: open a live pt variant URL - it must swap now (the
    pt/pt-PT locale mismatch is fixed server-side; no regeneration needed).
 5. Dashboard: the filter row (product / language / meta mode) appears above
    the list, rows are tickable, and "Export ... to CSV" downloads a
    spreadsheet of the filtered or selected links.
+6. Persistence: open a variant URL, then navigate to the product page
+   WITHOUT the parameter - the adapted copy should still show. Append
+   ?cx=off and reload - the normal page returns and stays.
 
 ## Behavior notes
 

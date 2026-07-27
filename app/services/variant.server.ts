@@ -18,7 +18,12 @@ import {
   getShopLocales,
   type AdminClient,
 } from "./shopify-data.server";
-import type { CopySurface, SurfaceContent, VariantPayload } from "./types";
+import {
+  normalizeAdaptationMode,
+  type CopySurface,
+  type SurfaceContent,
+  type VariantPayload,
+} from "./types";
 
 // Opaque, keyword-free slug for the public URL. Deliberately meaningless so
 // the parameter carries no query intent to crawlers or competitors.
@@ -32,7 +37,10 @@ export function generateVariantHandle(): string {
 }
 
 const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
-  allowedTags: sanitizeHtml.defaults.allowedTags.concat(["img", "h1", "h2"]),
+  // button: the theme's FAQ accordions use <button> question rows; without
+  // it the sanitizer would flatten swapped FAQ markup. Attributes stay
+  // restricted to class, so a served button carries no behavior of its own.
+  allowedTags: sanitizeHtml.defaults.allowedTags.concat(["img", "h1", "h2", "button"]),
   allowedAttributes: {
     ...sanitizeHtml.defaults.allowedAttributes,
     img: ["src", "alt", "width", "height", "loading"],
@@ -47,6 +55,17 @@ export function sanitizeAdaptedHtml(html: string): string {
   return sanitizeHtml(html, SANITIZE_OPTIONS);
 }
 
+// V2 plan entries are generated copy shown on the review page: apply the
+// same dash normalization as every other stored generation output.
+function normalizeV2Items(
+  items: Array<{ point: string; detail: string }>,
+): Array<{ point: string; detail: string }> {
+  return items.map((item) => ({
+    point: normalizeGeneratedPunctuation(item.point),
+    detail: normalizeGeneratedPunctuation(item.detail),
+  }));
+}
+
 export async function createArticlesForProduct(
   admin: AdminClient,
   shop: string,
@@ -56,8 +75,9 @@ export async function createArticlesForProduct(
     urls: string[];
     pastedTitle?: string;
     pastedText?: string;
-    /** Applies to every article in this batch; read at generation time. */
-    metaMode?: boolean;
+    /** Adaptation mode for every article in this batch; read at generation
+     *  time. "standard" | "meta" | "ultra" | "persona" | "max" | "v2". */
+    mode?: string;
   },
 ): Promise<string[]> {
   const product = await getProduct(admin, input.productId);
@@ -99,7 +119,7 @@ export async function createArticlesForProduct(
           sourceUrl: row.sourceUrl ?? null,
           sourceTitle: row.sourceTitle ?? null,
           sourceText: row.sourceText ?? null,
-          metaMode: input.metaMode ?? false,
+          mode: normalizeAdaptationMode(input.mode ?? "standard"),
           status: "pending",
           variantHandle: generateVariantHandle(),
         },
@@ -201,7 +221,7 @@ export async function generateForArticle(
       productTitle: article.productTitle,
       locale: article.locale,
       intensity: settings.intensity,
-      metaMode: article.metaMode,
+      mode: normalizeAdaptationMode(article.mode),
       surfaces,
     });
 
@@ -230,7 +250,44 @@ export async function generateForArticle(
       throw new Error("Generation produced no usable surfaces. Retry.");
     }
 
-    const guard = await claimGuard(pairs, text);
+    // Ultra mode's removal permission must never leave a heading with no
+    // body or an empty list on the live page: deterministic backstop on top
+    // of the prompt rule. Fails the generation loudly (retryable) instead
+    // of serving a visibly broken section.
+    if (["ultra", "persona", "max", "v2"].includes(normalizeAdaptationMode(article.mode))) {
+      for (const pair of pairs) {
+        const surface = surfaces.find((s) => s.surface.key === pair.key);
+        if (surface?.surface.mode !== "html") continue;
+        const problem = emptySectionProblem(pair.adapted);
+        if (problem) {
+          throw new Error(
+            `The adaptation left ${problem} in "${surface.surface.label}". Retry the generation.`,
+          );
+        }
+      }
+    }
+
+    // The FAQ tab's accordions only function if the adapted HTML keeps the
+    // theme's exact class names (the embed re-binds clicks via
+    // .accordion__group / .accordion__copy). Deterministic backstop on top
+    // of the prompt rule, in EVERY mode, for any surface whose original
+    // markup contained accordion groups.
+    for (const pair of pairs) {
+      const surface = surfaces.find((s) => s.surface.key === pair.key);
+      if (surface?.surface.mode !== "html") continue;
+      const problem = accordionMarkupProblem(pair.original, pair.adapted);
+      if (problem) {
+        throw new Error(
+          `The adaptation produced ${problem} in "${surface.surface.label}". Retry the generation.`,
+        );
+      }
+    }
+
+    const guard = await claimGuard(
+      pairs,
+      text,
+      normalizeAdaptationMode(article.mode),
+    );
 
     // Same completeness rule as the adaptation pass: a surface the guard
     // silently skipped would be stored with no findings and become approvable
@@ -272,7 +329,8 @@ export async function generateForArticle(
         const guardFindings = guard.get(pair.key);
         const heuristics = heuristicFindings(pair.original, adaptedContent, {
           articleText: text,
-          metaMode: article.metaMode,
+          // Proof-token downgrades are a Meta-mode-only affordance.
+          metaMode: article.mode === "meta",
         });
         const warnings = [
           ...(guardFindings?.warnings ?? []),
@@ -309,7 +367,48 @@ export async function generateForArticle(
           queryVariants: JSON.stringify(analysis.queryVariants),
           evidence: JSON.stringify(analysis.evidence),
           proofPoints: proofPoints.length ? JSON.stringify(proofPoints) : null,
-          generatedMetaMode: article.metaMode,
+          personaPriorities: analysis.personaPriorities.length
+            ? JSON.stringify(
+                analysis.personaPriorities.map((priority) => ({
+                  ...priority,
+                  point: normalizeGeneratedPunctuation(priority.point),
+                })),
+              )
+            : null,
+          conversionPlan: analysis.conversionPlan
+            ? JSON.stringify({
+                readerStage: normalizeGeneratedPunctuation(
+                  analysis.conversionPlan.readerStage,
+                ),
+                desires: analysis.conversionPlan.desires.map((d) => ({
+                  ...d,
+                  point: normalizeGeneratedPunctuation(d.point),
+                })),
+                objections: analysis.conversionPlan.objections.map((d) => ({
+                  ...d,
+                  point: normalizeGeneratedPunctuation(d.point),
+                })),
+                criteria: analysis.conversionPlan.criteria.map((d) => ({
+                  ...d,
+                  point: normalizeGeneratedPunctuation(d.point),
+                })),
+              })
+            : null,
+          v2Plan: analysis.v2Plan
+            ? JSON.stringify({
+                readerStage: normalizeGeneratedPunctuation(
+                  analysis.v2Plan.readerStage,
+                ),
+                compression: normalizeGeneratedPunctuation(
+                  analysis.v2Plan.compression,
+                ),
+                expectations: normalizeV2Items(analysis.v2Plan.expectations),
+                redundancy: normalizeV2Items(analysis.v2Plan.redundancy),
+                cededGround: normalizeV2Items(analysis.v2Plan.cededGround),
+                gaps: normalizeV2Items(analysis.v2Plan.gaps),
+              })
+            : null,
+          generatedMode: normalizeAdaptationMode(article.mode),
           // Post-publication review model: a successful generation goes live
           // immediately (served only while the master serving switch is on)
           // and resets reviewedAt so the merchant is notified to review the
@@ -432,6 +531,87 @@ export function servedLocaleMatches(
     stored === requested ||
     (!stored.includes("-") && requested.startsWith(`${stored}-`))
   );
+}
+
+/**
+ * Detects visibly broken structures Ultra mode's removal permission could
+ * produce: a heading with no content before the next heading (or the end),
+ * or an empty list. Returns a human-readable description or null. Flat
+ * sibling structures only, which is what the copy surfaces use; any parse
+ * trouble returns null (never blocks generation by itself).
+ */
+export function emptySectionProblem(html: string): string | null {
+  try {
+    const $ = loadHtml(`<div id="pt-root">${html}</div>`);
+    const root = $("#pt-root");
+    for (const list of root.find("ul, ol").toArray()) {
+      if ($(list).find("li").toArray().every((li) => $(li).text().trim() === "")) {
+        return "an empty list";
+      }
+    }
+    // A "heading block" is a bare h1-h6 OR a wrapper whose entire text is a
+    // single nested heading (the theme's <div class="tab__heading"><h2>…
+    // pattern). Everything else counts as section body.
+    const isHeadingBlock = (el: unknown): boolean => {
+      const $el = $(el as never);
+      const tag = ($el.prop("tagName") as string | undefined)?.toLowerCase() ?? "";
+      if (/^h[1-6]$/.test(tag)) return true;
+      const nested = $el.find("h1, h2, h3, h4, h5, h6").first();
+      return nested.length > 0 && $el.text().trim() === nested.text().trim();
+    };
+    const children = root.children().toArray();
+    for (let i = 0; i < children.length; i++) {
+      if (!isHeadingBlock(children[i])) continue;
+      let hasBody = false;
+      for (let j = i + 1; j < children.length; j++) {
+        if (isHeadingBlock(children[j])) break;
+        if ($(children[j]).text().trim() !== "") {
+          hasBody = true;
+          break;
+        }
+      }
+      if (!hasBody) {
+        return `a heading with no content beneath it ("${$(children[i]).text().trim().slice(0, 60)}")`;
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The theme's FAQ accordions only work when the adapted HTML keeps the
+ * exact class names the storefront scripts and styles key on
+ * (.accordion__group with a <button> question row and an .accordion__copy
+ * answer). Checked only when the ORIGINAL markup contained accordion
+ * groups; returns a human-readable description or null. Any parse trouble
+ * returns null (never blocks generation by itself).
+ */
+export function accordionMarkupProblem(
+  originalHtml: string,
+  adaptedHtml: string,
+): string | null {
+  try {
+    const $orig = loadHtml(`<div id="pt-root">${originalHtml}</div>`);
+    if ($orig("#pt-root").find(".accordion__group").length === 0) return null;
+    const $ = loadHtml(`<div id="pt-root">${adaptedHtml}</div>`);
+    const groups = $("#pt-root").find(".accordion__group").toArray();
+    if (groups.length === 0) {
+      return "question-and-answer content without the original accordion markup (no .accordion__group)";
+    }
+    for (const group of groups) {
+      if ($(group).find("button").length === 0) {
+        return "an accordion group without a <button> question row";
+      }
+      if ($(group).find(".accordion__copy").length === 0) {
+        return "an accordion group without an answer element (.accordion__copy)";
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 /** True while a non-stale generation lock is held for the article. */
