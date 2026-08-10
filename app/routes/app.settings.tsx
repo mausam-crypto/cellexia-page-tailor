@@ -34,7 +34,8 @@ import {
 } from "../services/settings.server";
 import { unsafeSelectorReason } from "../services/selector-rules";
 import { getProductMetafieldDefinitions } from "../services/shopify-data.server";
-import type { CopySurface } from "../services/types";
+import type { CopySurface, SubtleModeSettings } from "../services/types";
+import { normalizeSubtleSettings } from "../services/types";
 
 const PARAM_NAME_RE = /^[a-z0-9_]{1,12}$/;
 
@@ -126,6 +127,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   return {
     paramName: settings.paramName,
     intensity: settings.intensity,
+    subtle: settings.subtle,
     servingEnabled: settings.servingEnabled,
     approvedCount,
     metafieldsUnavailable,
@@ -144,6 +146,16 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       ? (intensityRaw as "medium" | "deep")
       : ("light" as const);
   const servingEnabled = formData.get("servingEnabled") === "true";
+
+  // Field-by-field fallback to defaults: a malformed value can never make
+  // the subtle dials unsaveable.
+  let subtleParsed: unknown = {};
+  try {
+    subtleParsed = JSON.parse(String(formData.get("subtle") ?? "{}"));
+  } catch {
+    subtleParsed = {};
+  }
+  const subtle = normalizeSubtleSettings(subtleParsed);
 
   let parsed: unknown = [];
   try {
@@ -226,6 +238,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   await saveSettings(session.shop, {
     paramName,
     intensity,
+    subtle,
     surfaces,
     servingEnabled,
   });
@@ -258,6 +271,7 @@ export default function Settings() {
 
   const [paramName, setParamName] = useState(loaderData.paramName);
   const [intensity, setIntensity] = useState<string>(loaderData.intensity);
+  const [subtle, setSubtle] = useState<SubtleModeSettings>(loaderData.subtle);
   const [servingEnabled, setServingEnabled] = useState(
     loaderData.servingEnabled,
   );
@@ -287,12 +301,13 @@ export default function Settings() {
       {
         paramName,
         intensity,
+        subtle: JSON.stringify(subtle),
         servingEnabled: String(servingEnabled),
         surfaces: JSON.stringify(rows),
       },
       { method: "POST" },
     );
-  }, [paramName, intensity, servingEnabled, rows, submit]);
+  }, [paramName, intensity, subtle, servingEnabled, rows, submit]);
 
   return (
     <Page
@@ -386,6 +401,132 @@ export default function Settings() {
                   value={intensity}
                   onChange={setIntensity}
                   helpText="Light shifts emphasis only. Medium reworks more wording. Deep may also add sentences so the copy speaks to the reader's specific need. Every variant is claim-guarded at generation and flagged for your review after it goes live. Each surface below can override this default."
+                />
+              </BlockStack>
+            </Card>
+
+            <Card>
+              <BlockStack gap="400">
+                <BlockStack gap="200">
+                  <Text as="h2" variant="headingMd">
+                    Subtle intent mode
+                  </Text>
+                  <Text as="p" variant="bodyMd" tone="subdued">
+                    Tuning dials for the Subtle intent adaptation mode only.
+                    They change the generation prompt directly and take
+                    effect the next time an article generates - existing
+                    variants are untouched until you regenerate them.
+                  </Text>
+                </BlockStack>
+                <InlineGrid columns={{ xs: 1, md: 3 }} gap="300">
+                  <Select
+                    label="Planted sentences per surface"
+                    options={[
+                      { label: "1 — one precise sentence", value: "1" },
+                      { label: "2", value: "2" },
+                      { label: "3", value: "3" },
+                    ]}
+                    value={String(subtle.insertionsPerSurface)}
+                    onChange={(value) =>
+                      setSubtle((s) => ({
+                        ...s,
+                        insertionsPerSurface:
+                          value === "2" ? 2 : value === "3" ? 3 : 1,
+                      }))
+                    }
+                    helpText="Maximum NEW sentences positioning the product for the reader's concern, per touched surface."
+                  />
+                  <Select
+                    label="Coverage"
+                    options={[
+                      { label: "Focused — 1-2 surfaces", value: "focused" },
+                      { label: "Balanced — typically 2-3", value: "balanced" },
+                      { label: "Broad — wherever plausible", value: "broad" },
+                    ]}
+                    value={subtle.coverage}
+                    onChange={(value) =>
+                      setSubtle((s) => ({
+                        ...s,
+                        coverage:
+                          value === "balanced" || value === "broad"
+                            ? value
+                            : "focused",
+                      }))
+                    }
+                    helpText="How many surfaces may carry the concern. Untouched surfaces come back unchanged."
+                  />
+                  <Select
+                    label="Concern naming"
+                    options={[
+                      {
+                        label: "Auto — unprompted-brand test per term",
+                        value: "auto",
+                      },
+                      {
+                        label: "Adjacent only — never name it",
+                        value: "adjacent",
+                      },
+                      { label: "Direct — prefer the term", value: "direct" },
+                    ]}
+                    value={subtle.explicitness}
+                    onChange={(value) =>
+                      setSubtle((s) => ({
+                        ...s,
+                        explicitness:
+                          value === "adjacent" || value === "direct"
+                            ? value
+                            : "auto",
+                      }))
+                    }
+                    helpText='Auto: natural product vocabulary ("night cream") is used outright, article jargon ("collagen alternative") becomes adjacent phrasing ("supports collagen production").'
+                  />
+                  <Select
+                    label="Tagline handling"
+                    options={[
+                      { label: "Never touch the tagline", value: "never" },
+                      {
+                        label: "Rephrase — tilt, never name",
+                        value: "rephrase",
+                      },
+                      { label: "Full — may name the concern", value: "full" },
+                    ]}
+                    value={subtle.taglineTouch}
+                    onChange={(value) =>
+                      setSubtle((s) => ({
+                        ...s,
+                        taglineTouch:
+                          value === "rephrase" || value === "full"
+                            ? value
+                            : "never",
+                      }))
+                    }
+                    helpText="Short surfaces (under ~200 characters) are the most visible spot on the page - naming the concern there is the easiest way to look engineered."
+                  />
+                  <Select
+                    label="Preservation floor"
+                    options={[
+                      { label: "90% wording kept (safest)", value: "90" },
+                      { label: "80% wording kept", value: "80" },
+                      { label: "70% wording kept", value: "70" },
+                    ]}
+                    value={String(subtle.preservationFloor)}
+                    onChange={(value) =>
+                      setSubtle((s) => ({
+                        ...s,
+                        preservationFloor:
+                          value === "80" ? 80 : value === "70" ? 70 : 90,
+                      }))
+                    }
+                    helpText="Outside the planted sentences, at least this share of each touched surface's wording stays identical."
+                  />
+                </InlineGrid>
+                <Checkbox
+                  label="Planted sentences may form new paragraphs or list items"
+                  checked={subtle.allowNewBlocks}
+                  onChange={(value) =>
+                    setSubtle((s) => ({ ...s, allowNewBlocks: value }))
+                  }
+                  helpText="Off: planted sentences are folded into existing paragraphs and list items (least visible). On: a planted sentence may stand as its own new paragraph or bullet within the existing structure."
                 />
               </BlockStack>
             </Card>

@@ -3,8 +3,10 @@ import type {
   AdaptationMode,
   ArticleAnalysis,
   ClaimFindings,
+  SubtleModeSettings,
   SurfaceContent,
 } from "./types";
+import { DEFAULT_SUBTLE_SETTINGS } from "./types";
 
 const MODEL = process.env.PAGE_TAILOR_MODEL || "claude-opus-4-8";
 
@@ -239,6 +241,45 @@ const ANALYSIS_SCHEMA = {
       description:
         "Ultra Custom V2 mode only: the four article-derived inventories plus reader diagnosis and length decision. Empty strings and empty arrays otherwise.",
     },
+    subtle_plan: {
+      type: "object",
+      properties: {
+        concern: {
+          type: "string",
+          description:
+            "Subtle intent mode only: the single product need the arriving reader is shopping to satisfy. Empty string otherwise.",
+        },
+        term_decision: {
+          type: "string",
+          description:
+            "Subtle intent mode only: the unprompted-brand test outcome - whether the concern's own name may appear in the copy, and the phrasing chosen instead when it may not. Empty string otherwise.",
+        },
+        insertions: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              point: {
+                type: "string",
+                description:
+                  "One planted or edited sentence, exactly as it appears in the adapted copy",
+              },
+              detail: {
+                type: "string",
+                description:
+                  "The surface it landed in, plus why it is plausible unprompted brand copy and what grounds it",
+              },
+            },
+            required: ["point", "detail"],
+            additionalProperties: false,
+          },
+        },
+      },
+      required: ["concern", "term_decision", "insertions"],
+      additionalProperties: false,
+      description:
+        "Subtle intent mode only: the concern, the term decision, and every planted sentence. Empty strings and empty array otherwise.",
+    },
     surfaces: {
       type: "array",
       items: {
@@ -269,6 +310,7 @@ const ANALYSIS_SCHEMA = {
     "persona_priorities",
     "conversion_plan",
     "v2_plan",
+    "subtle_plan",
     "surfaces",
   ],
   additionalProperties: false,
@@ -340,7 +382,10 @@ function parseModelJson(text: string, pass: string): unknown {
   }
 }
 
-function adaptationSystemPrompt(mode: AdaptationMode): string {
+function adaptationSystemPrompt(
+  mode: AdaptationMode,
+  subtle: SubtleModeSettings = DEFAULT_SUBTLE_SETTINGS,
+): string {
   const intro = `You are a conversion copy editor for an e-commerce skincare brand. Visitors arrive at a product page from a specific editorial article, and your job is to adapt the page's existing copy so it resonates with what that reader was searching for — while remaining a completely normal, truthful product page.
 
 You will receive:
@@ -356,12 +401,67 @@ First, infer the Google search query the article was written to rank for, with b
 - Any depth: if a surface is already ideally aligned with this reader, return it unchanged — never force edits.
 - Surfaces under ~200 characters (taglines): the output stays a single concise sentence in the same register; the length rule applies loosely.
 
-Return empty proof_points and persona_priorities arrays, an empty conversion_plan (empty reader_stage, empty lists), and an empty v2_plan: none are used in this mode.`;
+Return empty proof_points and persona_priorities arrays, an empty conversion_plan (empty reader_stage, empty lists), an empty v2_plan, and an empty subtle_plan: none are used in this mode.`;
+
+  // Subtle-intent mode: every dial below maps to one sentence of the prompt
+  // so the mode can be re-tuned from Settings without code changes.
+  const subtleCoverage =
+    subtle.coverage === "broad"
+      ? `Any surface where the concern fits plausibly may carry a planted sentence; still skip surfaces where it would feel forced.`
+      : subtle.coverage === "balanced"
+        ? `Plant the concern only in the surfaces where it fits most naturally - typically 2-3 across the page; every other surface returns unchanged or with at most trivial emphasis touches.`
+        : `Choose the 1-2 surfaces where the concern lands most naturally (usually the main description or the single most relevant tab) and plant it only there; every other surface returns unchanged or with at most trivial emphasis touches.`;
+
+  const subtleExplicitness =
+    subtle.explicitness === "adjacent"
+      ? `\nFor this batch, ALWAYS take the FAILS branch: never print the concern's own name verbatim anywhere, even when it is ordinary product vocabulary; speak only to the underlying need in the brand's own terms.`
+      : subtle.explicitness === "direct"
+        ? `\nFor this batch, lean direct: whenever the term is grounded and not clearly article-side jargon, prefer the concern's own name over adjacent phrasing.`
+        : "";
+
+  const subtleInsertionShape = subtle.allowNewBlocks
+    ? `it may either fold into an existing paragraph or list item's flow or, in HTML surfaces, stand as its own new sibling <p> or <li> element`
+    : `it must fold into an existing paragraph or list item's flow, never stand as a new element`;
+
+  const subtleTagline =
+    subtle.taglineTouch === "full"
+      ? `Surfaces under ~200 characters (taglines): may carry the concern when the unprompted-brand test allows its name; the output stays a single concise sentence in the same register.`
+      : subtle.taglineTouch === "rephrase"
+        ? `Surfaces under ~200 characters (taglines): you may tilt the emphasis toward the concern's underlying benefit, but never name the concern or its product type there; the output stays a single concise sentence in the same register.`
+        : `Surfaces under ~200 characters (taglines): return them completely UNCHANGED. Naming the concern in the page's most prominent line is exactly the tell this mode exists to avoid.`;
+
+  const subtleDepth = `SUBTLE INTENT MODE. The reader arrives with one specific concern, and this page must simply happen to be the perfect answer to it - written exactly as a brand that never saw the article and knows nothing about this reader would write it. Ignore the depth attribute on surfaces: this mode sets its own conservatism. It works like a light adaptation, with one targeted power: it PLANTS a small number of precise sentences that position the product for the reader's concern. Work in these steps:
+
+STEP 1 - Name the concern: from the detected query and the article's framing, state the single product need this reader is shopping to satisfy (e.g. "a night cream", "a way to support the skin's own collagen"). Report it in subtle_plan.concern.
+
+STEP 2 - Run the UNPROMPTED-BRAND TEST on the concern's vocabulary: would a brand with no knowledge of the article naturally print this term on its own product page?
+- PASSES: the term is ordinary product vocabulary - a product type, use case, or audience a brand would plausibly claim on its own ("night cream", "a face cream for men"). The copy may adopt it: it is completely realistic for a brand to describe its product as a night cream.
+- FAILS: the term is article-side vocabulary - a search-query formulation, list or comparison framing, or category jargon a brand would never volunteer ("collagen alternative", "retinol dupe", "the best X", "X substitutes"). The copy must NEVER print it. Speak instead to the underlying need in the brand's own terms: for "collagen alternatives" the copy may say the product stimulates and supports the skin's own collagen production (when the sources support that), but never call it a "collagen alternative".
+- THE TEST GOVERNS VOCABULARY ONLY; GROUNDING GOVERNS FACTS AND OUTRANKS IT. A term that passes the test may itself assert a product fact - an ingredient, property, certification, number, or result ("for sensitive skin", "vegan", "fragrance-free"). Print such a term only when the original copy or the article states that fact; otherwise reframe toward the underlying concern without asserting the fact word ("gentle formula", never "fragrance-free"), or leave it out. Plausibility never justifies asserting an unstated fact, and the same bar applies to the FAILS branch's replacement phrasing.${subtleExplicitness}
+Report the decision and the phrasing you chose in subtle_plan.term_decision.
+
+STEP 3 - Plant the positioning:
+- ${subtleCoverage}
+- Budget: at most ${subtle.insertionsPerSurface} planted sentence${subtle.insertionsPerSurface === 1 ? "" : "s"} per touched surface. A planted sentence is one NEW sentence built for the concern, and ${subtleInsertionShape}.
+- Each planted sentence is a declarative product statement in the brand's voice, indistinguishable from the surrounding copy: never a question to the reader ("Looking for a night cream?"), never a nod to their journey or search, never urgency - and placed where its subject would naturally live (a usage claim near usage, a benefit among benefits), never bolted onto the end of a surface.
+- Planted content obeys the grounding rule strictly: position the product for the concern only as far as the original copy or the article truthfully supports, stated no more strongly than the sources state it. If the sources cannot support the concern at all, plant nothing - return the surfaces essentially unchanged and say so in the notes rather than stretch the truth.
+- Beyond the planted sentences, stay conservative: keep at least ${subtle.preservationFloor}% of each touched surface's wording identical, changing only emphasis and a handful of phrases. If a surface is already ideally aligned with this reader, return it unchanged - never force edits.
+- ${subtleTagline}
+- Report every planted sentence AND every existing sentence you edited to carry the concern (a tagline rephrase included) in subtle_plan.insertions (point = the sentence exactly as it appears in the adapted copy; detail = which surface it landed in, whether it was planted or edited, why it reads as unprompted brand copy, and what grounds it). Only report sentences that actually appear in an adapted surface. Return empty proof_points and persona_priorities arrays, an empty conversion_plan, and an empty v2_plan.`;
+
+  const subtleHtmlRule = subtle.allowNewBlocks
+    ? `- For HTML surfaces, preserve the existing tag structure (same headings, paragraphs, lists in the same order); you may add a sibling <p> or <li> element to hold a planted sentence, but never remove or reorder existing elements, and never add attributes, images, or links.`
+    : `- For HTML surfaces, preserve the same tag structure (same headings, paragraphs, lists in the same order) and adapt only the text inside: planted sentences fold into existing elements, and no elements are ever added, removed, or reordered. Never add attributes, images, or links.`;
+
+  const subtleOnlyRules = `- Do not mention the article, "as seen in", press, rankings, or reviews, and never address the reader's search or journey ("as you just read", "if you've been searching for"); the page must read as if the brand never saw the article.
+- Even when the article supports them, do not add proof-element language: statistics, percentages, study or test results, clinical/professional endorsements, rankings, awards. (Those are reserved for Meta mode articles.)
+- VOCABULARY PRECEDENCE: the unprompted-brand test's decision and the merchant's concern-naming setting outrank every vocabulary permission below, including reader-vocabulary mirroring - a term the test or setting rejects is never printed, even when the sources support it.
+${subtleHtmlRule}`;
 
   const metaDepth = `META MODE. This page is the landing context for the article's paid social traffic: it must read as the article's direct continuation, so a reader who just finished the article finds every promise, proof, and angle confirmed on the page. Produce an adapted version of EVERY surface provided:
 - Ignore the depth attribute on surfaces: rework each surface as deeply as needed — up to a full rewrite — so the page mirrors the article's angle, vocabulary, and promise. Length may grow up to +60% per surface.
 - Extract the article's specific proof elements — study wins and results, test outcomes, rankings (e.g. "ranked #1 of the 5 serums tested"), statistics, awards, expert or dermatologist endorsements — and weave the relevant ones into the copy where a reader arriving from the article expects them. Phrase each exactly as strongly as the article does, never stronger, and never invent or embellish one. You may name the study, test, or publication when the article itself names it.
-- Report every proof element you used in proof_points, each with a short verbatim supporting quote from the article. Only report proof elements that actually appear in an adapted surface. Return an empty persona_priorities array, an empty conversion_plan, and an empty v2_plan.
+- Report every proof element you used in proof_points, each with a short verbatim supporting quote from the article. Only report proof elements that actually appear in an adapted surface. Return an empty persona_priorities array, an empty conversion_plan, an empty v2_plan, and an empty subtle_plan.
 - Surfaces under ~200 characters (taglines): the output stays a single concise sentence in the same register; it may carry the article's strongest proof element when it fits naturally.
 - If a surface is already ideally aligned with this reader, return it unchanged — never force edits.`;
 
@@ -382,7 +482,7 @@ Return empty proof_points and persona_priorities arrays, an empty conversion_pla
 - Do NOT pull the article's proof elements: no statistics, percentages, study or test results, rankings, awards, clinical or professional endorsements, or press references, even where the article contains them. Those are Meta mode's tool; Ultra custom is about intent, not proof.
 - Surfaces under ~200 characters (taglines): the output stays a single concise sentence in the same register, aimed squarely at the intent (naming the audience or use case there is encouraged when it fits naturally).
 - If a surface is already ideally aligned with this reader, return it unchanged - never force edits.
-- Return empty proof_points and persona_priorities arrays, an empty conversion_plan, and an empty v2_plan.`;
+- Return empty proof_points and persona_priorities arrays, an empty conversion_plan, an empty v2_plan, and an empty subtle_plan.`;
 
   const ultraOnlyRules = `- Do not mention the article, "as seen in", press, rankings, or reviews, and do not address the reader's journey ("as you just read"); the page must stand alone.
 - HTML surfaces: you may rephrase heading text, add sibling <p> or <li> elements, and REMOVE <p> or <li> elements whose content is irrelevant to the intent - but never remove headings (keep their number and order), and never add attributes, images, or links.
@@ -390,7 +490,7 @@ Return empty proof_points and persona_priorities arrays, an empty conversion_pla
 
   const sharedRules = `- PUNCTUATION: never use em dashes (—) or en dashes (–) in adapted copy, even where the article or the original copy uses them. Use a simple hyphen "-" or restructure the sentence.
 - A surface whose original copy is a single paragraph must remain exactly one paragraph: fold any additions into its flow and keep its length close to the original (no more than about +25% longer), even where the mode's rules would otherwise allow more growth or added paragraphs.
-- Mirror the reader's vocabulary where it maps to supported content (e.g. if the article says "forehead lines" and the copy says "expression lines", you may use "forehead lines") — but never let borrowed vocabulary smuggle in an unsupported claim; in particular, never adopt a vocabulary term that itself asserts an ingredient, property, certification, number, or result the sources do not state. If the article and the copy are in different languages, translate the reader's vocabulary into the copy's language instead of borrowing it verbatim.
+- Mirror the reader's vocabulary where it maps to supported content (e.g. if the article says "forehead lines" and the copy says "expression lines", you may use "forehead lines") — but never let borrowed vocabulary smuggle in an unsupported claim; in particular, never adopt a vocabulary term that itself asserts an ingredient, property, certification, number, or result the sources do not state. Mirroring is a permission, never an obligation: when the active mode's rules forbid printing a term (e.g. a failed unprompted-brand test or a naming setting), that prohibition outranks this rule and the term is never mirrored, even when grounded. If the article and the copy are in different languages, translate the reader's vocabulary into the copy's language instead of borrowing it verbatim.
 - Keep cosmetic-appropriate language: appearance-of / look-of phrasing. Never drug-like claims (treat, cure, heal, repair skin damage, medical conditions), even if the article uses them.
 - Do not add urgency, scarcity, discounts, or price language, even if the article uses them.
 - Keep the brand voice of the original copy.
@@ -410,7 +510,7 @@ STEP 3 - Cover the list across the page with importance-tiered placement:
 - Low-importance items appear once, in a fitting lower position.
 - Aim to address every item on the list somewhere on the page - but only with content grounded per the rules below. If an item cannot be truthfully addressed from the original copy or the article, skip it; the list drives selection and emphasis, never invention.
 
-Rework each surface as deeply as needed (ignore the depth attribute), up to a full rewrite; length may grow up to +60% per surface and you may also SHORTEN by removing content irrelevant to this persona (rules below). Mirror the persona's vocabulary throughout (translated into the copy's language). Surfaces under ~200 characters (taglines): a single concise sentence carrying the top-priority item. If a surface is already ideally aligned, return it unchanged. Do NOT pull the article's proof elements (no statistics, percentages, studies, rankings, awards, endorsements, or press references) - like Ultra custom, this mode is about intent, not proof. Return an empty proof_points array, an empty conversion_plan, and an empty v2_plan.`;
+Rework each surface as deeply as needed (ignore the depth attribute), up to a full rewrite; length may grow up to +60% per surface and you may also SHORTEN by removing content irrelevant to this persona (rules below). Mirror the persona's vocabulary throughout (translated into the copy's language). Surfaces under ~200 characters (taglines): a single concise sentence carrying the top-priority item. If a surface is already ideally aligned, return it unchanged. Do NOT pull the article's proof elements (no statistics, percentages, studies, rankings, awards, endorsements, or press references) - like Ultra custom, this mode is about intent, not proof. Return an empty proof_points array, an empty conversion_plan, an empty v2_plan, and an empty subtle_plan.`;
 
   const maxDepth = `ULTRA CUSTOM CONVERSION MAX MODE. The deepest conversion-focused tailoring: diagnose the arriving reader, build three ranked lists, and rewrite the page as one coherent conversion plan. Work in these steps:
 
@@ -430,7 +530,7 @@ STEP 3 - Rewrite every surface as one conversion plan:
 - FAQ surfaces (question-and-answer groups): preserve the exact markup pattern (each question element and answer element keeps its tag structure), and re-select and re-word questions and answers toward this reader's likely next questions, drawn from the three lists - grounded only. NEVER change the facts of usage directions, safety, shipping, or policy answers: reorder or trim them, but their factual content stays exactly as stated. Skip questions you cannot answer from grounded material.
 - SUBTLETY above all: the tailoring must feel like the page was always written this way. Vary sentence rhythm, do not repeat the same intent phrase across every surface, and never let the reader sense a template or a source article behind the page.
 
-Rework each surface as deeply as needed (ignore the depth attribute), up to a full rewrite; length may grow up to +60% per surface and you may also SHORTEN by removing content irrelevant to this reader (rules below). Taglines (under ~200 characters): one concise sentence carrying the top desire or the strongest criterion. If a surface is already ideal, return it unchanged. Do NOT pull the article's proof elements (no statistics, percentages, studies, rankings, awards, endorsements, or press references). Return empty proof_points and persona_priorities arrays and an empty v2_plan; conversion_plan is where your lists go.`;
+Rework each surface as deeply as needed (ignore the depth attribute), up to a full rewrite; length may grow up to +60% per surface and you may also SHORTEN by removing content irrelevant to this reader (rules below). Taglines (under ~200 characters): one concise sentence carrying the top desire or the strongest criterion. If a surface is already ideal, return it unchanged. Do NOT pull the article's proof elements (no statistics, percentages, studies, rankings, awards, endorsements, or press references). Return empty proof_points and persona_priorities arrays, an empty v2_plan, and an empty subtle_plan; conversion_plan is where your lists go.`;
 
   const v2Depth = `ULTRA CUSTOM V2 MODE. The reader has JUST finished the article: treat the article as chapter one and write the page as its sequel - never a restart of the pitch, never a repetition. Work in these steps:
 
@@ -450,7 +550,7 @@ STEP 3 - Rewrite every surface as the article's sequel:
 - STAGE-MATCHED LENGTH (moderate): let the reader stage set the length. For product-aware, nearly-sold readers, tighten: compress or remove content irrelevant to what this article's reader came for - up to about 25% shorter per surface and never more; this is a trim, not a gutting. For problem-aware readers, explain more fully instead. Record the decision in v2_plan.compression.
 - HARD CAP on all of the above: confirming an expectation, occupying ceded ground, or answering a gap must never introduce a product fact (an ingredient, property, certification, number, or result) that neither the original copy nor the article states. Plausibility never justifies asserting an unstated fact; reframe toward what the copy does support, or stay silent.
 
-Rework each surface as deeply as needed (ignore the depth attribute); length may grow up to +40% per surface where the reader needs fuller explanation, and may shrink per the stage-matched rule above. Taglines (under ~200 characters): one concise sentence meeting the reader's strongest expectation without merely repeating the article's words. If a surface is already ideal, return it unchanged. Do NOT pull the article's proof elements (no statistics, percentages, studies, rankings, awards, endorsements, or press references). Return empty proof_points and persona_priorities arrays and an empty conversion_plan; v2_plan is where your inventories go.`;
+Rework each surface as deeply as needed (ignore the depth attribute); length may grow up to +40% per surface where the reader needs fuller explanation, and may shrink per the stage-matched rule above. Taglines (under ~200 characters): one concise sentence meeting the reader's strongest expectation without merely repeating the article's words. If a surface is already ideal, return it unchanged. Do NOT pull the article's proof elements (no statistics, percentages, studies, rankings, awards, endorsements, or press references). Return empty proof_points and persona_priorities arrays, an empty conversion_plan, and an empty subtle_plan; v2_plan is where your inventories go.`;
 
   const closing =
     mode === "meta"
@@ -463,7 +563,9 @@ Rework each surface as deeply as needed (ignore the depth attribute); length may
             ? `The result must read like the product page this reader would have designed for themselves — their priorities leading, their doubts already answered where they arise, excelling where they learned to look wherever the grounded facts allow — while feeling completely organic and never engineered.`
             : mode === "v2"
               ? `The result must read like the natural second chapter of what the reader just finished — every expectation met, nothing repeated, the open questions answered, strongest exactly where they now know to look — while standing completely on its own for a reader who never saw the article.`
-              : `The result must read like the page always looked this way — a normal product page that simply happens to be written for exactly what this reader needs.`;
+              : mode === "subtle"
+                ? `The result must read like a page the brand would have published anyway - and only the arriving reader notices, in a few quiet places, that this product happens to be exactly what they came looking for.`
+                : `The result must read like the page always looked this way — a normal product page that simply happens to be written for exactly what this reader needs.`;
 
   const depthSection =
     mode === "meta"
@@ -476,9 +578,12 @@ Rework each surface as deeply as needed (ignore the depth attribute); length may
             ? maxDepth
             : mode === "v2"
               ? v2Depth
-              : standardDepth;
+              : mode === "subtle"
+                ? subtleDepth
+                : standardDepth;
   // Persona, conversion-max, and V2 share Ultra's structural rules (removal
-  // permission, no article mentions, no orphaned sections).
+  // permission, no article mentions, no orphaned sections). Subtle has its
+  // own: standard's posture plus the planted-sentence allowance.
   const modeRules =
     mode === "meta"
       ? metaOnlyRules
@@ -487,7 +592,9 @@ Rework each surface as deeply as needed (ignore the depth attribute); length may
           mode === "max" ||
           mode === "v2"
         ? ultraOnlyRules
-        : standardOnlyRules;
+        : mode === "subtle"
+          ? subtleOnlyRules
+          : standardOnlyRules;
 
   return [
     intro,
@@ -504,6 +611,8 @@ export async function analyzeAndAdapt(options: {
   locale: string;
   intensity: "light" | "medium" | "deep";
   mode: AdaptationMode;
+  /** Subtle-intent dials; only read when mode === "subtle". */
+  subtle?: SubtleModeSettings;
   surfaces: SurfaceContent[];
 }): Promise<ArticleAnalysis> {
   const surfacesBlock = options.surfaces
@@ -536,7 +645,7 @@ Adapt every surface above for readers arriving from this article.`;
       model: MODEL,
       max_tokens: 32000,
       thinking: { type: "adaptive" },
-      system: adaptationSystemPrompt(options.mode),
+      system: adaptationSystemPrompt(options.mode, options.subtle),
       output_config: {
         format: {
           type: "json_schema",
@@ -571,6 +680,11 @@ Adapt every surface above for readers arriving from this article.`;
       ceded_ground: Array<{ point: string; detail: string }>;
       gaps: Array<{ point: string; detail: string }>;
     };
+    subtle_plan: {
+      concern: string;
+      term_decision: string;
+      insertions: Array<{ point: string; detail: string }>;
+    };
     surfaces: Array<{ key: string; adapted: string; notes: string }>;
   };
 
@@ -602,6 +716,14 @@ Adapt every surface above for readers arriving from this article.`;
             redundancy: parsed.v2_plan.redundancy,
             cededGround: parsed.v2_plan.ceded_ground,
             gaps: parsed.v2_plan.gaps,
+          }
+        : null,
+    subtlePlan:
+      options.mode === "subtle"
+        ? {
+            concern: parsed.subtle_plan.concern,
+            termDecision: parsed.subtle_plan.term_decision,
+            insertions: parsed.subtle_plan.insertions,
           }
         : null,
     adapted: parsed.surfaces,
@@ -649,8 +771,8 @@ A "claim" is any factual assertion: benefits, results, ingredients, statistics, 
         ? ""
         : `\n\nADDITIONALLY: this adaptation mode forbids proof elements entirely. Place ANY new proof element in the adapted copy - a statistic, percentage, study or test result, ranking, award, professional or expert endorsement, or press reference - in unsupported_claims even when the article supports it, so it blocks review.`
     }${
-      mode === "max" || mode === "v2"
-        ? `\n\nMODE CONTEXT: this adaptation mode intentionally restates existing original-copy features in the arriving reader's vocabulary and angles them at what that reader is seeking (their desires, doubts, evaluation criteria, expectations, and open questions). Such a reframe is NOT a new claim as long as it asserts no product fact beyond the feature it restates - do not flag mere re-angling, re-emphasis, or vocabulary changes of existing original-copy content. DO place a claim in unsupported_claims when it asserts a product fact (an ingredient, property, certification, number, or result) that neither the original copy nor the article states, or states an article-backed claim more strongly than the article does. The proof-element rule above is unaffected.`
+      mode === "max" || mode === "v2" || mode === "subtle"
+        ? `\n\nMODE CONTEXT: this adaptation mode intentionally restates existing original-copy features in the arriving reader's vocabulary and angles them at what that reader is seeking (their desires, doubts, evaluation criteria, expectations, open questions, or the specific concern they are shopping to satisfy). Such a reframe is NOT a new claim as long as it asserts no product fact beyond the feature it restates - do not flag mere re-angling, re-emphasis, or vocabulary changes of existing original-copy content. DO place a claim in unsupported_claims when it asserts a product fact (an ingredient, property, certification, number, or result) that neither the original copy nor the article states, or states an article-backed claim more strongly than the article does. The proof-element rule above is unaffected.`
         : ""
     }`,
     output_config: {

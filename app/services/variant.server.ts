@@ -76,7 +76,8 @@ export async function createArticlesForProduct(
     pastedTitle?: string;
     pastedText?: string;
     /** Adaptation mode for every article in this batch; read at generation
-     *  time. "standard" | "meta" | "ultra" | "persona" | "max" | "v2". */
+     *  time. "standard" | "subtle" | "meta" | "ultra" | "persona" | "max"
+     *  | "v2". */
     mode?: string;
   },
 ): Promise<string[]> {
@@ -224,6 +225,7 @@ export async function generateForArticle(
       locale: article.locale,
       intensity: settings.intensity,
       mode: normalizeAdaptationMode(article.mode),
+      subtle: settings.subtle,
       surfaces,
     });
 
@@ -319,15 +321,37 @@ export async function generateForArticle(
         normalizedArticle.includes(normalizeForMatch(p.quote)),
     }));
 
+    // Stored (dash-normalized, sanitized) adapted content per surface,
+    // computed once: written to the overrides below and used to verify the
+    // subtle plan's reported insertions against what actually got stored.
+    const storedAdapted = new Map(
+      pairs.map((pair) => {
+        const surface = surfaces.find((s) => s.surface.key === pair.key)!;
+        const dashFree = normalizeGeneratedPunctuation(pair.adapted);
+        return [
+          pair.key,
+          surface.surface.mode === "html"
+            ? sanitizeAdaptedHtml(dashFree)
+            : dashFree,
+        ] as const;
+      }),
+    );
+
+    // Subtle-mode insertions are shown to the reviewer as "the sentence
+    // exactly as it appears in the adapted copy" — same trust posture as
+    // proof-point quotes: verify each deterministically instead of trusting
+    // the model's self-report, and flag any we can't find.
+    const adaptedCorpus = normalizeForMatch(
+      [...storedAdapted.values()]
+        .map((content) => content.replace(/<[^>]*>/g, " "))
+        .join(" "),
+    );
+
     await prisma.$transaction([
       prisma.override.deleteMany({ where: { articleId: article.id } }),
       ...pairs.map((pair) => {
         const surface = surfaces.find((s) => s.surface.key === pair.key)!;
-        const dashFree = normalizeGeneratedPunctuation(pair.adapted);
-        const adaptedContent =
-          surface.surface.mode === "html"
-            ? sanitizeAdaptedHtml(dashFree)
-            : dashFree;
+        const adaptedContent = storedAdapted.get(pair.key)!;
         const guardFindings = guard.get(pair.key);
         const heuristics = heuristicFindings(pair.original, adaptedContent, {
           articleText: text,
@@ -408,6 +432,24 @@ export async function generateForArticle(
                 redundancy: normalizeV2Items(analysis.v2Plan.redundancy),
                 cededGround: normalizeV2Items(analysis.v2Plan.cededGround),
                 gaps: normalizeV2Items(analysis.v2Plan.gaps),
+              })
+            : null,
+          subtlePlan: analysis.subtlePlan
+            ? JSON.stringify({
+                concern: normalizeGeneratedPunctuation(
+                  analysis.subtlePlan.concern,
+                ),
+                termDecision: normalizeGeneratedPunctuation(
+                  analysis.subtlePlan.termDecision,
+                ),
+                insertions: normalizeV2Items(
+                  analysis.subtlePlan.insertions,
+                ).map((item) => ({
+                  ...item,
+                  verified:
+                    normalizeForMatch(item.point) !== "" &&
+                    adaptedCorpus.includes(normalizeForMatch(item.point)),
+                })),
               })
             : null,
           generatedMode: normalizeAdaptationMode(article.mode),

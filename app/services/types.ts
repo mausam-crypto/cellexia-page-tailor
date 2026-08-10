@@ -11,6 +11,14 @@ export type AdaptationDepth = "light" | "medium" | "deep";
 /**
  * Per-article adaptation mode:
  * - standard: intent re-emphasis within the configured depths.
+ * - subtle: "Subtle intent" - standard's conservatism (structure preserved,
+ *   most wording identical) plus a small budget of planted sentences that
+ *   position the product for the reader's specific concern. Each planted
+ *   term passes the "unprompted-brand test": natural product vocabulary
+ *   ("night cream") may be adopted outright, article-side jargon ("collagen
+ *   alternative") never appears - the copy speaks to the underlying need
+ *   instead. Tuned by ShopSettings.subtle dials; no proof elements,
+ *   Google-safe.
  * - meta: deepest rewrite plus the article's proof elements (study wins,
  *   rankings, statistics), for Meta paid-social funnels.
  * - ultra: deepest intent/use-case tailoring - recenters every surface on
@@ -34,6 +42,7 @@ export type AdaptationDepth = "light" | "medium" | "deep";
  */
 export type AdaptationMode =
   | "standard"
+  | "subtle"
   | "meta"
   | "ultra"
   | "persona"
@@ -41,13 +50,79 @@ export type AdaptationMode =
   | "v2";
 
 export function normalizeAdaptationMode(value: string): AdaptationMode {
-  return value === "meta" ||
+  return value === "subtle" ||
+    value === "meta" ||
     value === "ultra" ||
     value === "persona" ||
     value === "max" ||
     value === "v2"
     ? value
     : "standard";
+}
+
+/**
+ * Subtle-intent mode dials, stored per shop and read at generation time so
+ * the mode can be refined from Settings without code changes. Every field
+ * feeds a specific sentence of the adaptation prompt.
+ */
+export interface SubtleModeSettings {
+  /** Max NEW sentences planted per touched surface. */
+  insertionsPerSurface: 1 | 2 | 3;
+  /** How many surfaces may carry the concern: focused = the 1-2 most
+   *  natural homes; balanced = typically 2-3; broad = wherever plausible. */
+  coverage: "focused" | "balanced" | "broad";
+  /** Unprompted-brand test bias: auto = per-term test; adjacent = never
+   *  print the concern's own name; direct = prefer the verbatim term
+   *  whenever grounded and not clear article jargon. */
+  explicitness: "auto" | "adjacent" | "direct";
+  /** Short surfaces (<~200 chars): never touch, rephrase toward the
+   *  underlying benefit without naming the concern, or full (may name it
+   *  when the test allows). */
+  taglineTouch: "never" | "rephrase" | "full";
+  /** Min % of wording kept identical per touched surface, outside the
+   *  planted sentences. */
+  preservationFloor: 90 | 80 | 70;
+  /** Whether a planted sentence may be a new sibling <p>/<li> (true) or
+   *  must fold into an existing element's flow (false). */
+  allowNewBlocks: boolean;
+}
+
+export const DEFAULT_SUBTLE_SETTINGS: SubtleModeSettings = {
+  insertionsPerSurface: 1,
+  coverage: "focused",
+  explicitness: "auto",
+  taglineTouch: "never",
+  preservationFloor: 90,
+  allowNewBlocks: false,
+};
+
+/** Parse a stored/submitted subtle-settings value; anything malformed or
+ *  missing falls back field-by-field to the conservative defaults. */
+export function normalizeSubtleSettings(raw: unknown): SubtleModeSettings {
+  const r = (typeof raw === "object" && raw !== null ? raw : {}) as Record<
+    string,
+    unknown
+  >;
+  const insertions = Number(r.insertionsPerSurface);
+  const floor = Number(r.preservationFloor);
+  return {
+    insertionsPerSurface:
+      insertions === 2 || insertions === 3 ? insertions : 1,
+    coverage:
+      r.coverage === "balanced" || r.coverage === "broad"
+        ? r.coverage
+        : "focused",
+    explicitness:
+      r.explicitness === "adjacent" || r.explicitness === "direct"
+        ? r.explicitness
+        : "auto",
+    taglineTouch:
+      r.taglineTouch === "rephrase" || r.taglineTouch === "full"
+        ? r.taglineTouch
+        : "never",
+    preservationFloor: floor === 80 || floor === 70 ? floor : 90,
+    allowNewBlocks: r.allowNewBlocks === true || r.allowNewBlocks === "true",
+  };
 }
 
 /** One ranked persona desire (deep-persona mode). */
@@ -97,6 +172,28 @@ export interface V2Plan {
   gaps: V2PlanItem[];
 }
 
+/** One planted (or concern-edited) sentence reported by subtle mode. */
+export interface SubtleInsertion extends V2PlanItem {
+  /** Set at generation time: whether the reported sentence was actually
+   *  found in the stored adapted copy (whitespace/case-insensitive, tags
+   *  stripped). False means the model's report could not be verified and
+   *  the copy must be checked by hand. */
+  verified?: boolean;
+}
+
+/** Subtle-intent mode: what the generation planted and why, shown as a
+ *  review card so the dials can be evaluated against real output. */
+export interface SubtlePlan {
+  /** The single product need the arriving reader is shopping to satisfy. */
+  concern: string;
+  /** Unprompted-brand test outcome: whether the concern's own name may
+   *  appear in copy, and the phrasing chosen instead when it may not. */
+  termDecision: string;
+  /** Each planted or edited sentence (point) with the surface it landed in
+   *  and its plausibility/grounding rationale (detail). */
+  insertions: SubtleInsertion[];
+}
+
 export interface CopySurface {
   /** Stable key, e.g. "description" or "mf:accentuate:science_section" */
   key: string;
@@ -125,6 +222,8 @@ export interface ShopSettingsData {
   paramName: string;
   /** Shop-wide default adaptation depth (per-surface depth overrides it). */
   intensity: AdaptationDepth;
+  /** Subtle-intent mode dials; read at generation time. */
+  subtle: SubtleModeSettings;
   surfaces: CopySurface[];
   /** Master switch. False on install: nothing is ever served until the
    *  merchant explicitly turns serving on. */
@@ -161,6 +260,8 @@ export interface ArticleAnalysis {
   conversionPlan: ConversionPlan | null;
   /** Ultra Custom V2 mode: the four inventories + diagnosis. Null otherwise. */
   v2Plan: V2Plan | null;
+  /** Subtle-intent mode: concern, term decision, insertions. Null otherwise. */
+  subtlePlan: SubtlePlan | null;
   adapted: Array<{
     key: string;
     adapted: string;

@@ -222,6 +222,11 @@ export default function NewArticles() {
                       value: "standard",
                     },
                     {
+                      label:
+                        "Subtle intent — conservative + planted concern positioning",
+                      value: "subtle",
+                    },
+                    {
                       label: "Meta mode — deep rewrite + the article's proof elements",
                       value: "meta",
                     },
@@ -244,7 +249,7 @@ export default function NewArticles() {
                   ]}
                   value={mode}
                   onChange={setMode}
-                  helpText="Applies to every article in this batch (changeable per article later). Meta mode pulls the article's study wins, rankings, and statistics into the copy — for Meta (Facebook/Instagram) funnels only. Ultra custom recenters the whole page on the article audience's intent and vocabulary (e.g. face creams for men, night creams), may drop claims irrelevant to that audience, and never pulls proof elements. Ultra deep persona goes further: it builds a ranked list of everything that audience wants to hear and places the top items in the tagline, description, and overview. Conversion Max runs three ranked lists (desires, objections, decision criteria), sequences the page for the reader's awareness stage, answers doubts where they arise, quietly excels on the article's evaluation criteria, and tailors the FAQ tab - all organic, no proof elements. Ultra Custom V2 treats the page as the article's sequel: it confirms every expectation the article set, leads with what the article did not already say, is strongest where the article found the alternatives lacking, answers the questions the article left open, and moderately tightens the page for nearly-sold readers."
+                  helpText="Applies to every article in this batch (changeable per article later). Subtle intent stays as conservative as a light Standard pass but plants a few precise sentences that position the product for the reader's exact concern - naming it only when a brand would naturally say it unprompted (a night cream article yields night-cream copy; a collagen-alternatives article yields 'supports collagen production', never 'collagen alternative'); tune it in Settings. Meta mode pulls the article's study wins, rankings, and statistics into the copy — for Meta (Facebook/Instagram) funnels only. Ultra custom recenters the whole page on the article audience's intent and vocabulary (e.g. face creams for men, night creams), may drop claims irrelevant to that audience, and never pulls proof elements. Ultra deep persona goes further: it builds a ranked list of everything that audience wants to hear and places the top items in the tagline, description, and overview. Conversion Max runs three ranked lists (desires, objections, decision criteria), sequences the page for the reader's awareness stage, answers doubts where they arise, quietly excels on the article's evaluation criteria, and tailors the FAQ tab - all organic, no proof elements. Ultra Custom V2 treats the page as the article's sequel: it confirms every expectation the article set, leads with what the article did not already say, is strongest where the article found the alternatives lacking, answers the questions the article left open, and moderately tightens the page for nearly-sold readers."
                 />
                 <Divider />
                 <BlockStack gap="300">

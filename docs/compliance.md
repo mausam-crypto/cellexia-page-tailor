@@ -77,6 +77,41 @@ review notification (see the post-publication review section below) and drive
 its urgency. Manual edits re-run the heuristics and re-sanitize HTML at save
 time.
 
+## Subtle intent mode
+
+Subtle intent (added 2026-08-09) is the standard family's targeted variant:
+it plants a small, budgeted number of sentences that position the product
+for the arriving reader's specific concern. At the default dials it keeps
+standard's conservatism — structure preserved, 90% of each touched
+surface's wording identical, one planted sentence per surface on 1-2
+surfaces, everything else returned unchanged. The Settings dials widen
+that envelope (up to three sentences per surface, broad coverage, a 70%
+wording floor, tagline positioning, and new sibling paragraphs/list
+items), so the conservatism described here is the default posture, not an
+enforced invariant — the invariants below hold at every dial setting. Each planted term must pass an
+**unprompted-brand test**: vocabulary a brand would naturally print on its
+own product page ("night cream", "for sensitive skin") may be adopted
+outright; article-side jargon ("collagen alternative", "retinol dupe",
+"best X" framings) is never printed — the copy speaks to the underlying
+need instead ("stimulates the skin's own collagen production"). The page
+must read as if the brand never saw the article: no article references, no
+reader-journey or search addressing, and no proof elements (statistics,
+study results, rankings, endorsements, press — all blocked by the guard
+exactly as in standard mode). Claim grounding applies in full to every
+planted sentence: the concern is positioned only as far as the original
+copy or the article truthfully supports, and when the sources cannot
+support it, nothing is planted. The generation reports every planted or
+concern-edited sentence with its grounding rationale on the review page;
+each reported sentence is deterministically checked against the stored
+copy (like meta mode's proof quotes) and flagged when it cannot be found,
+but the report itself is model-produced — the reviewer's check of the
+adapted surfaces remains the backstop. The mode's dials
+(sentences per surface, coverage, concern naming, tagline handling,
+preservation floor, new-block permission) live in Settings and only change
+the generation prompt — no code path differs. Because it adds no proof
+language, Subtle intent stays inside the Google-funnel posture and is safe
+on Google Ads traffic.
+
 ## Meta mode
 
 Meta mode is a **per-batch opt-in** for articles that run as Meta

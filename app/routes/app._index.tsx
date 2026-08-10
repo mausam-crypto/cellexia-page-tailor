@@ -369,7 +369,9 @@ function buildLinksCsv(rows: ArticleRow[], servingEnabled: boolean): string {
               ? "Conversion Max"
               : a.mode === "v2"
                 ? "Ultra Custom V2"
-                : "Standard",
+                : a.mode === "subtle"
+                  ? "Subtle intent"
+                  : "Standard",
       statusTextFor(a),
       a.detectedQuery ?? "",
       a.createdAt.slice(0, 10),
@@ -521,6 +523,7 @@ export default function Index() {
   const modeOptions = [
     { label: "All modes", value: "all" },
     { label: "Standard only", value: "standard" },
+    { label: "Subtle intent only", value: "subtle" },
     { label: "Meta mode only", value: "meta" },
     { label: "Ultra custom only", value: "ultra" },
     { label: "Ultra deep persona only", value: "persona" },
@@ -634,6 +637,9 @@ export default function Index() {
           ) : (
             statusBadge(article.status, article.reviewedAt, article.errorMessage)
           )}
+          {article.mode === "subtle" ? (
+            <Badge tone="magic">Subtle</Badge>
+          ) : null}
           {article.mode === "meta" ? <Badge tone="magic">Meta</Badge> : null}
           {article.mode === "ultra" ? <Badge tone="magic">Ultra</Badge> : null}
           {article.mode === "persona" ? (

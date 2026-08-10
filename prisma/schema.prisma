@@ -21,6 +21,9 @@ model ShopSettings {
   paramName      String   @default("cx")
   intensity      String   @default("light") // light | medium
   surfaces       String   @default("[]")
+  // Subtle-intent mode dials as a JSON object (SubtleModeSettings); "{}"
+  // means every dial at its conservative default. Read at generation time.
+  subtleSettings String   @default("{}")
   // Master kill switch. OFF by default: a fresh install never changes
   // anything on the storefront until the merchant explicitly enables serving.
   servingEnabled Boolean  @default(false)
@@ -117,13 +120,17 @@ model Article {
   // marks it reviewed (or takes it offline). Null = live awaiting review.
   reviewedAt    DateTime?
   // Adaptation mode, set per URL batch at creation (flippable per article;
-  // takes effect at generation): standard | meta | ultra | persona | max | v2.
-  // meta pulls the article's proof elements (study wins, rankings, stats);
-  // ultra rewrites deepest for the article's audience intent/use case, may
-  // remove irrelevant claims, but never pulls proof elements; persona is
-  // ultra plus a ranked audience-desire list driving placement; v2 writes
-  // the page as the article's sequel (expectations/redundancy/ceded
-  // ground/gaps inventories with moderate stage-matched compression).
+  // takes effect at generation):
+  // standard | subtle | meta | ultra | persona | max | v2.
+  // subtle keeps standard's conservatism but plants a dial-budgeted number
+  // of concern-positioning sentences (unprompted-brand test, no proof
+  // elements); meta pulls the article's proof elements (study wins,
+  // rankings, stats); ultra rewrites deepest for the article's audience
+  // intent/use case, may remove irrelevant claims, but never pulls proof
+  // elements; persona is ultra plus a ranked audience-desire list driving
+  // placement; v2 writes the page as the article's sequel (expectations/
+  // redundancy/ceded ground/gaps inventories with moderate stage-matched
+  // compression).
   mode          String     @default("standard")
   // Snapshot of mode at last generation: edit-time finding reclassification
   // must follow the mode the stored copy was generated under, not the live
@@ -133,6 +140,7 @@ model Article {
   personaPriorities String? // JSON [{point, importance}]: deep-persona ranked desire list
   conversionPlan    String? // JSON ConversionPlan: conversion-max reader stage + 3 ranked lists
   v2Plan            String? // JSON V2Plan: Ultra Custom V2 inventories + reader stage + length decision
+  subtlePlan        String? // JSON SubtlePlan: subtle-intent concern + term decision + insertions
   variantHandle String     @unique // opaque slug used in the public URL
   overrides     Override[]
   createdAt     DateTime   @default(now())

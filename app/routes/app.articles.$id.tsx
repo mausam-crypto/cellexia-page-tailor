@@ -34,9 +34,12 @@ import type {
   ConversionPlan,
   PersonaPriority,
   ProofPoint,
+  SubtleInsertion,
+  SubtlePlan,
   V2Plan,
   V2PlanItem,
 } from "../services/types";
+import { normalizeAdaptationMode } from "../services/types";
 import {
   getPrimaryDomainUrl,
   getShopLocales,
@@ -151,6 +154,36 @@ function parseV2Plan(value: string | null): V2Plan | null {
       redundancy: list(parsed.redundancy),
       cededGround: list(parsed.cededGround),
       gaps: list(parsed.gaps),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseSubtlePlan(value: string | null): SubtlePlan | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const insertions: SubtleInsertion[] = Array.isArray(parsed.insertions)
+      ? parsed.insertions
+          .filter(
+            (
+              p,
+            ): p is { point: unknown; detail: unknown; verified?: unknown } =>
+              typeof p === "object" && p !== null,
+          )
+          .map((p) => ({
+            point: String(p.point ?? ""),
+            detail: String(p.detail ?? ""),
+            verified: typeof p.verified === "boolean" ? p.verified : undefined,
+          }))
+          .filter((p) => p.point !== "")
+      : [];
+    return {
+      concern: String(parsed.concern ?? ""),
+      termDecision: String(parsed.termDecision ?? ""),
+      insertions,
     };
   } catch {
     return null;
@@ -376,6 +409,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     personaPriorities: parsePersonaPriorities(article.personaPriorities),
     conversionPlan: parseConversionPlan(article.conversionPlan),
     v2Plan: parseV2Plan(article.v2Plan),
+    subtlePlan: parseSubtlePlan(article.subtlePlan),
     overrides: article.overrides.map((o) => ({
       id: o.id,
       surfaceKey: o.surfaceKey,
@@ -441,14 +475,7 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     // Only affects the next generation: the stored (possibly live) copy was
     // produced under the previous mode and keeps serving unchanged.
     const requested = String(formData.get("mode") ?? "standard");
-    const nextMode =
-      requested === "meta" ||
-      requested === "ultra" ||
-      requested === "persona" ||
-      requested === "max" ||
-      requested === "v2"
-        ? requested
-        : "standard";
+    const nextMode = normalizeAdaptationMode(requested);
     await prisma.article.update({
       where: { id: article.id },
       data: { mode: nextMode },
@@ -565,6 +592,7 @@ export default function ArticleReview() {
     personaPriorities,
     conversionPlan,
     v2Plan,
+    subtlePlan,
     overrides,
     variantUrl,
   } = useLoaderData<typeof loader>();
@@ -676,7 +704,9 @@ export default function ArticleReview() {
                 ? "Ultra Custom Conversion Max"
                 : modeFetcher.data.mode === "v2"
                   ? "Ultra Custom V2"
-                  : "Standard";
+                  : modeFetcher.data.mode === "subtle"
+                    ? "Subtle intent"
+                    : "Standard";
       shopify.toast.show(
         `Mode set to ${label} — takes effect when you regenerate`,
       );
@@ -732,6 +762,9 @@ export default function ArticleReview() {
       titleMetadata={
         <InlineStack gap="100">
           {statusBadge(article.status, article.reviewedAt)}
+          {article.mode === "subtle" && (
+            <Badge tone="magic">Subtle intent</Badge>
+          )}
           {article.mode === "meta" && <Badge tone="magic">Meta mode</Badge>}
           {article.mode === "ultra" && <Badge tone="magic">Ultra custom</Badge>}
           {article.mode === "persona" && (
@@ -757,22 +790,32 @@ export default function ArticleReview() {
       ]}
       actionGroups={[
         {
-          title: `Mode: ${article.mode === "meta" ? "Meta" : article.mode === "ultra" ? "Ultra" : article.mode === "persona" ? "Persona" : article.mode === "max" ? "Max" : article.mode === "v2" ? "V2" : "Standard"}`,
+          title: `Mode: ${article.mode === "meta" ? "Meta" : article.mode === "ultra" ? "Ultra" : article.mode === "persona" ? "Persona" : article.mode === "max" ? "Max" : article.mode === "v2" ? "V2" : article.mode === "subtle" ? "Subtle" : "Standard"}`,
           actions: (
-            ["standard", "meta", "ultra", "persona", "max", "v2"] as const
+            [
+              "standard",
+              "subtle",
+              "meta",
+              "ultra",
+              "persona",
+              "max",
+              "v2",
+            ] as const
           ).map((m) => ({
             content:
               m === "standard"
                 ? "Standard"
-                : m === "meta"
-                  ? "Meta mode"
-                  : m === "ultra"
-                    ? "Ultra custom"
-                    : m === "persona"
-                      ? "Ultra deep persona"
-                      : m === "max"
-                        ? "Ultra Custom Conversion Max"
-                        : "Ultra Custom V2",
+                : m === "subtle"
+                  ? "Subtle intent"
+                  : m === "meta"
+                    ? "Meta mode"
+                    : m === "ultra"
+                      ? "Ultra custom"
+                      : m === "persona"
+                        ? "Ultra deep persona"
+                        : m === "max"
+                          ? "Ultra Custom Conversion Max"
+                          : "Ultra Custom V2",
             disabled:
               article.mode === m ||
               isGenerating ||
@@ -977,6 +1020,18 @@ export default function ArticleReview() {
               </BlockStack>
             </Card>
 
+            {article.mode === "subtle" && article.status === "pending" && (
+              <Banner tone="info" title="Subtle intent article">
+                Generation will stay as conservative as a light Standard pass
+                but plant a few precise sentences that position the product
+                for this article's reader - naming their concern only when a
+                brand would naturally print it unprompted, otherwise speaking
+                to the underlying need in the brand's own words. Tune the
+                dials in Settings. No study results or rankings are pulled.
+                The planted sentences appear here for review once it goes
+                live.
+              </Banner>
+            )}
             {article.mode === "meta" && article.status === "pending" && (
               <Banner tone="info" title="Meta mode article">
                 Generation will rewrite the page deeply and pull the article's
@@ -1267,6 +1322,71 @@ export default function ArticleReview() {
                         ))}
                       </BlockStack>
                     ) : null,
+                  )}
+                </BlockStack>
+              </Card>
+            )}
+
+            {subtlePlan && (
+              <Card>
+                <BlockStack gap="300">
+                  <Text as="h2" variant="headingMd">
+                    Planted positioning (Subtle intent)
+                  </Text>
+                  {subtlePlan.concern && (
+                    <Text as="p" variant="bodyMd">
+                      <Text as="span" fontWeight="semibold">
+                        Reader&apos;s concern:{" "}
+                      </Text>
+                      {subtlePlan.concern}
+                    </Text>
+                  )}
+                  {subtlePlan.termDecision && (
+                    <Text as="p" variant="bodyMd">
+                      <Text as="span" fontWeight="semibold">
+                        Unprompted-brand test:{" "}
+                      </Text>
+                      {subtlePlan.termDecision}
+                    </Text>
+                  )}
+                  <Text as="p" tone="subdued" variant="bodySm">
+                    Each sentence the generation reports having planted or
+                    edited for the concern, with where it landed and why it
+                    should read as copy the brand would have written
+                    unprompted. This list is the model&apos;s own report -
+                    still check the copy below: if a sentence gives away
+                    that the page knows about the article, tighten the
+                    dials in Settings and regenerate.
+                  </Text>
+                  {subtlePlan.insertions.length > 0 ? (
+                    <BlockStack gap="150">
+                      {subtlePlan.insertions.map((item, index) => (
+                        <BlockStack gap="050" key={index}>
+                          <Text as="span" variant="bodyMd">
+                            {item.point}
+                          </Text>
+                          {item.detail && (
+                            <Text as="span" variant="bodySm" tone="subdued">
+                              {item.detail}
+                            </Text>
+                          )}
+                          {item.verified === false && (
+                            <Text as="span" variant="bodySm" tone="critical">
+                              This sentence was not found in the stored copy
+                              - the report may be incomplete or reworded, so
+                              review the adapted surfaces themselves.
+                            </Text>
+                          )}
+                        </BlockStack>
+                      ))}
+                    </BlockStack>
+                  ) : (
+                    <Text as="p" variant="bodyMd" tone="subdued">
+                      The generation reported planting nothing (it judged
+                      the sources could not ground the concern). Skim the
+                      adapted surfaces below to confirm they are essentially
+                      unchanged.
+                    </Text>
                   )}
                 </BlockStack>
               </Card>

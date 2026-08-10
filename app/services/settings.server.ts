@@ -1,5 +1,6 @@
 import prisma from "../db.server";
 import type { CopySurface, ShopSettingsData } from "./types";
+import { DEFAULT_SUBTLE_SETTINGS, normalizeSubtleSettings } from "./types";
 
 export { unsafeSelectorReason } from "./selector-rules";
 
@@ -74,9 +75,16 @@ export async function getSettings(shop: string): Promise<ShopSettingsData> {
     return {
       paramName: "cx",
       intensity: "light",
+      subtle: DEFAULT_SUBTLE_SETTINGS,
       surfaces: DEFAULT_SURFACES,
       servingEnabled: false,
     };
+  }
+  let subtleRaw: unknown = {};
+  try {
+    subtleRaw = JSON.parse(row.subtleSettings);
+  } catch {
+    subtleRaw = {};
   }
   let surfaces: CopySurface[] = [];
   try {
@@ -100,6 +108,7 @@ export async function getSettings(shop: string): Promise<ShopSettingsData> {
       row.intensity === "medium" || row.intensity === "deep"
         ? row.intensity
         : "light",
+    subtle: normalizeSubtleSettings(subtleRaw),
     surfaces,
     servingEnabled: row.servingEnabled,
   };
@@ -113,12 +122,14 @@ export async function saveSettings(
   const merged: ShopSettingsData = {
     paramName: sanitizeParamName(data.paramName ?? current.paramName),
     intensity: data.intensity ?? current.intensity,
+    subtle: data.subtle ? normalizeSubtleSettings(data.subtle) : current.subtle,
     surfaces: data.surfaces ?? current.surfaces,
     servingEnabled: data.servingEnabled ?? current.servingEnabled,
   };
   const fields = {
     paramName: merged.paramName,
     intensity: merged.intensity,
+    subtleSettings: JSON.stringify(merged.subtle),
     surfaces: JSON.stringify(merged.surfaces),
     servingEnabled: merged.servingEnabled,
   };
