@@ -41,8 +41,8 @@ import type {
 } from "../services/types";
 import { normalizeAdaptationMode } from "../services/types";
 import {
-  getPrimaryDomainUrl,
-  getShopLocales,
+  getPrimaryDomainUrlCached,
+  getShopLocalesCached,
 } from "../services/shopify-data.server";
 import {
   buildVariantUrl,
@@ -346,25 +346,27 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   // Restart recovery for the background generation queue; no-op when idle.
   kickGenerationQueue();
 
-  const article = await prisma.article.findFirst({
-    where: { id: params.id, shop },
-    include: { overrides: { orderBy: { surfaceKey: "asc" } } },
-  });
+  const [article, settings] = await Promise.all([
+    prisma.article.findFirst({
+      where: { id: params.id, shop },
+      include: { overrides: { orderBy: { surfaceKey: "asc" } } },
+    }),
+    getSettings(shop),
+  ]);
   if (!article) {
     throw new Response("Article not found", { status: 404 });
   }
 
-  const settings = await getSettings(shop);
-
   // The page's core job (review + approve/unapprove, both local-DB actions)
   // must survive a flaky Admin API: degrade to locale codes and hide the
   // variant URL instead of replacing the whole page with an error boundary.
-  let locales: Awaited<ReturnType<typeof getShopLocales>> = [];
+  // Cached: after the first load these answer without a Shopify round trip.
+  let locales: Awaited<ReturnType<typeof getShopLocalesCached>> = [];
   let primaryDomainUrl: string | null = null;
   try {
     [locales, primaryDomainUrl] = await Promise.all([
-      getShopLocales(admin),
-      getPrimaryDomainUrl(admin),
+      getShopLocalesCached(admin, shop),
+      getPrimaryDomainUrlCached(admin, shop),
     ]);
   } catch {
     // Fall through with defaults; the UI shows a retry hint.

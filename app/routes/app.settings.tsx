@@ -33,7 +33,10 @@ import {
   surfaceKeyForMetafield,
 } from "../services/settings.server";
 import { unsafeSelectorReason } from "../services/selector-rules";
-import { getProductMetafieldDefinitions } from "../services/shopify-data.server";
+import {
+  getProductMetafieldDefinitionsCached,
+  type MetafieldDefinitionSummary,
+} from "../services/shopify-data.server";
 import type { CopySurface, SubtleModeSettings } from "../services/types";
 import { normalizeSubtleSettings } from "../services/types";
 
@@ -74,10 +77,14 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   ]);
   // Metafield definitions come from the Admin API; if it hiccups, still show
   // the page (description surface + previously saved metafield surfaces).
-  let allDefinitions: Awaited<ReturnType<typeof getProductMetafieldDefinitions>> = [];
+  // Cached: the paginated listing runs at most once per TTL, not per load.
+  let allDefinitions: MetafieldDefinitionSummary[] = [];
   let metafieldsUnavailable = false;
   try {
-    allDefinitions = await getProductMetafieldDefinitions(admin);
+    allDefinitions = await getProductMetafieldDefinitionsCached(
+      admin,
+      session.shop,
+    );
   } catch {
     metafieldsUnavailable = true;
   }

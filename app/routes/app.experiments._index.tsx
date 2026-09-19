@@ -19,7 +19,7 @@ import {
   ensureExperimentOrdersFresh,
   refreshExperimentStatus,
 } from "../services/experiment.server";
-import { getShopLocales } from "../services/shopify-data.server";
+import { getShopLocalesCached } from "../services/shopify-data.server";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -36,7 +36,7 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       where: { shop },
       orderBy: { createdAt: "desc" },
     }),
-    getShopLocales(admin),
+    getShopLocalesCached(admin, shop),
   ]);
   const primaryLocale = locales.find((l) => l.primary)?.locale ?? "en";
   const localeNames = new Map(locales.map((l) => [l.locale, l.name]));

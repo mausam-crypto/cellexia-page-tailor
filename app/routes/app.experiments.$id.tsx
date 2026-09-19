@@ -24,7 +24,7 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { getSettings } from "../services/settings.server";
-import { getShopLocales } from "../services/shopify-data.server";
+import { getShopLocalesCached } from "../services/shopify-data.server";
 import {
   computeExperimentReport,
   EARLY_STOP,
@@ -65,7 +65,7 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     experiment;
 
   const [locales, settings] = await Promise.all([
-    getShopLocales(admin),
+    getShopLocalesCached(admin, shop),
     getSettings(shop),
   ]);
   const primaryLocale = locales.find((l) => l.primary)?.locale ?? "en";

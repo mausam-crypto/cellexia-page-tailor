@@ -24,15 +24,22 @@ import { useAppBridge } from "@shopify/app-bridge-react";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { getSettings } from "../services/settings.server";
-import { getShopLocales } from "../services/shopify-data.server";
+import {
+  getShopLocales,
+  getShopLocalesCached,
+} from "../services/shopify-data.server";
 import {
   ALLOWED_BASELINE_DAYS,
   createExperiment,
 } from "../services/experiment.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
-  const locales = (await getShopLocales(admin)).filter((l) => l.published);
+  const { admin, session } = await authenticate.admin(request);
+  // Cached list for the form; the action below re-validates against a
+  // fresh fetch before creating anything.
+  const locales = (
+    await getShopLocalesCached(admin, session.shop)
+  ).filter((l) => l.published);
   return { locales, allowedBaselineDays: [...ALLOWED_BASELINE_DAYS] };
 };
 

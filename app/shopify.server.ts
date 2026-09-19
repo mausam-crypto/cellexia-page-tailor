@@ -7,6 +7,11 @@ import {
 } from "@shopify/shopify-app-remix/server";
 import { PrismaSessionStorage } from "@shopify/shopify-app-session-storage-prisma";
 import prisma from "./db.server";
+import { startKeepAlive } from "./services/keep-alive.server";
+
+// Keeps hosts that sleep idle services from putting the app (and the
+// in-process generation queue) to sleep; no-op in dev and when disabled.
+startKeepAlive();
 
 const shopify = shopifyApp({
   apiKey: process.env.SHOPIFY_API_KEY,

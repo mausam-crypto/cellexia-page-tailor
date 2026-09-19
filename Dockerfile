@@ -17,6 +17,11 @@ RUN npm remove @shopify/cli
 
 COPY . .
 
+# Generate the Prisma client at image build time. Doing this on boot (the
+# old `npm run setup` path) added tens of seconds to every cold start.
+# Production uses Postgres (`schema.production.prisma`), not local SQLite.
+RUN npx prisma generate --schema=./prisma/schema.production.prisma
+
 RUN npm run build
 
 CMD ["npm", "run", "docker-start"]

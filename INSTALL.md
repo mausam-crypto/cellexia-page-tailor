@@ -108,11 +108,23 @@ the pages where you work").
    - `SHOPIFY_APP_URL` = `https://<your-host>`
    - `SCOPES=read_products,read_translations,read_locales,read_orders`
    - `ANTHROPIC_API_KEY` (and optionally `PAGE_TAILOR_MODEL`)
+   - Optional: `PAGE_TAILOR_KEEP_ALIVE=off` disables the built-in keep-alive
+     self-ping (see the hosting note below).
 2. **Database:** the Prisma datasource is SQLite (`prisma/dev.sqlite`). In
    production either mount a persistent volume for the SQLite file, or switch
    the datasource in `prisma/schema.prisma` to Postgres/MySQL and re-run
-   migrations. On boot run `npm run setup` (prisma generate + migrate deploy)
-   — the Docker start command already does.
+   migrations. The Prisma client is generated at build time (Dockerfile /
+   npm install); on boot only `prisma migrate deploy` runs — the Docker
+   start command (`npm run docker-start`) already does. Keeping generate out
+   of the boot path is what keeps cold starts short — don't move it back.
+
+   **Hosting note (cold starts):** point the host's health check at
+   `/healthz` (cheap, unauthenticated) so deploys only switch over once the
+   server actually serves. Hosts that spin idle services down (e.g. Render
+   free instances) make the app take up to a minute to open after ~15 idle
+   minutes and pause queued generations; in production the server self-pings
+   `/healthz` every 10 minutes to stay warm. An always-on (paid) instance is
+   still the better fix — set `PAGE_TAILOR_KEEP_ALIVE=off` there.
 3. **Update `shopify.app.toml`:** set `application_url` to
    `https://<your-host>`, `[auth] redirect_urls` to
    `["https://<your-host>/auth/callback"]`, and `[app_proxy] url` to
@@ -153,6 +165,15 @@ into the app config). In production, complete section 4 steps 1–3, run
 `npm run deploy`, then reopen from Apps. To verify what is registered
 without any dashboard access, run `npm run shopify -- app info` — the app
 URL it reports must be your host, not a placeholder.
+
+**The app takes ~a minute to open, or times out, after sitting unused:** the
+host spun the instance down (free tiers do this after ~15 idle minutes) and
+the first request pays the whole boot. The production build self-pings
+`/healthz` every 10 minutes to prevent this — if it still happens, check
+that the deployed build includes the keep-alive, that
+`PAGE_TAILOR_KEEP_ALIVE` is not `off`, and that `SHOPIFY_APP_URL` is the
+real public https URL (the pinger derives its target from it). Upgrading to
+an always-on instance removes the problem at the root.
 
 For storefront issues see the table in [docs/setup.md](docs/setup.md) §6.
 First checks for "nothing happens on the storefront": app embed enabled?

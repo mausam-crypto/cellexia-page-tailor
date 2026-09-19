@@ -179,6 +179,111 @@ export async function getProductMetafieldDefinitions(
   }));
 }
 
+// ---------------------------------------------------------------------------
+// Per-shop TTL cache for shop data that changes rarely (locales, primary
+// domain, metafield definitions). Admin pages read these on every navigation;
+// without a cache each page load pays 1-2 Shopify round trips for answers
+// that are identical for months. A stale entry is served immediately while a
+// refresh runs behind the response, and a failed refresh keeps serving the
+// last good value — the same degrade-don't-break rule the routes already
+// follow, minus the empty degrade. In-process only, which matches the app's
+// single-server deployment assumption (see generation-queue.server.ts).
+// ---------------------------------------------------------------------------
+
+const CACHE_FRESH_MS = 10 * 60 * 1000;
+// Past this age a stale value is no longer served and the caller waits for
+// the refresh — bounds how outdated a degraded answer can ever be.
+const CACHE_STALE_LIMIT_MS = 24 * 60 * 60 * 1000;
+
+type ShopCacheEntry = {
+  value: unknown;
+  fetchedAt: number;
+  pending: Promise<unknown> | null;
+};
+
+// globalThis-keyed so dev-mode module reloads don't wipe the cache.
+const cacheStore = globalThis as typeof globalThis & {
+  __pageTailorShopCache?: Map<string, ShopCacheEntry>;
+};
+
+function shopCache(): Map<string, ShopCacheEntry> {
+  if (!cacheStore.__pageTailorShopCache) {
+    cacheStore.__pageTailorShopCache = new Map();
+  }
+  return cacheStore.__pageTailorShopCache;
+}
+
+async function cachedShopData<T>(
+  shop: string,
+  kind: string,
+  fetcher: () => Promise<T>,
+): Promise<T> {
+  const cache = shopCache();
+  const key = `${shop}:${kind}`;
+  let entry = cache.get(key);
+  if (!entry) {
+    entry = { value: null, fetchedAt: 0, pending: null };
+    cache.set(key, entry);
+  }
+
+  const age = Date.now() - entry.fetchedAt;
+  if (entry.fetchedAt > 0 && age < CACHE_FRESH_MS) return entry.value as T;
+
+  let pending = entry.pending;
+  if (!pending) {
+    const e = entry;
+    pending = fetcher().then(
+      (value) => {
+        e.value = value;
+        e.fetchedAt = Date.now();
+        e.pending = null;
+        return value;
+      },
+      (error) => {
+        e.pending = null;
+        throw error;
+      },
+    );
+    e.pending = pending;
+  }
+
+  if (entry.fetchedAt > 0 && age < CACHE_STALE_LIMIT_MS) {
+    // Serve stale now; the refresh settles behind the response (failures
+    // are retried by the next stale read, never surfaced here).
+    pending.catch(() => {});
+    return entry.value as T;
+  }
+  return pending as Promise<T>;
+}
+
+/** getShopLocales behind the shop-data cache — for admin page loaders. */
+export function getShopLocalesCached(
+  admin: AdminClient,
+  shop: string,
+): Promise<ShopLocale[]> {
+  return cachedShopData(shop, "locales", () => getShopLocales(admin));
+}
+
+/** getPrimaryDomainUrl behind the shop-data cache — for admin page loaders. */
+export function getPrimaryDomainUrlCached(
+  admin: AdminClient,
+  shop: string,
+): Promise<string> {
+  return cachedShopData(shop, "primaryDomain", () => getPrimaryDomainUrl(admin));
+}
+
+/** getProductMetafieldDefinitions behind the shop-data cache — a freshly
+ *  created Accentuate field can take up to the TTL to appear in Settings,
+ *  which beats paying the paginated listing on every Settings load. */
+export function getProductMetafieldDefinitionsCached(
+  admin: AdminClient,
+  shop: string,
+): Promise<MetafieldDefinitionSummary[]> {
+  return cachedShopData(shop, "metafieldDefinitions", () =>
+    getProductMetafieldDefinitions(admin),
+  );
+}
+
 export async function getShopLocales(admin: AdminClient): Promise<ShopLocale[]> {
   const data = await gql<{ shopLocales: ShopLocale[] }>(
     admin,

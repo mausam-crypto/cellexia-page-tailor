@@ -31,8 +31,8 @@ import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { getSettings } from "../services/settings.server";
 import {
-  getPrimaryDomainUrl,
-  getShopLocales,
+  getPrimaryDomainUrlCached,
+  getShopLocalesCached,
 } from "../services/shopify-data.server";
 import {
   buildVariantUrl,
@@ -73,12 +73,13 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
 
   // The dashboard's core job is listing articles from the local DB; a flaky
   // Admin API must degrade it (no locale names, no URLs), never break it.
-  let locales: Awaited<ReturnType<typeof getShopLocales>> = [];
+  // Cached: after the first load these answer without a Shopify round trip.
+  let locales: Awaited<ReturnType<typeof getShopLocalesCached>> = [];
   let primaryDomainUrl: string | null = null;
   try {
     [locales, primaryDomainUrl] = await Promise.all([
-      getShopLocales(admin),
-      getPrimaryDomainUrl(admin),
+      getShopLocalesCached(admin, shop),
+      getPrimaryDomainUrlCached(admin, shop),
     ]);
   } catch {
     // Fall through with defaults.
@@ -90,28 +91,31 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   // local data only. Order syncing hits the Admin API with potentially many
   // paged calls and belongs on the Experiments pages, not on every home-page
   // load; computeExperimentReport suppresses alerts on stale data anyway.
-  const criticalExperiments: Array<{
-    id: string;
-    productTitle: string;
-    locale: string;
-  }> = [];
-  for (const row of runningExperiments) {
-    // Any failure here must degrade to "no banner", never a broken home page.
-    try {
-      const experiment = await refreshExperimentStatus(row);
-      if (experiment.status !== "running") continue;
-      const report = await computeExperimentReport(shop, experiment, primaryLocale);
-      if (report.alerts.some((a) => a.severity === "critical")) {
-        criticalExperiments.push({
-          id: experiment.id,
-          productTitle: experiment.productTitle,
-          locale: experiment.locale,
-        });
-      }
-    } catch {
-      // Skip this experiment; the Experiments pages surface sync problems.
-    }
-  }
+  const criticalExperiments = (
+    await Promise.all(
+      runningExperiments.map(async (row) => {
+        // Any failure must degrade to "no banner", never a broken home page.
+        try {
+          const experiment = await refreshExperimentStatus(row);
+          if (experiment.status !== "running") return null;
+          const report = await computeExperimentReport(
+            shop,
+            experiment,
+            primaryLocale,
+          );
+          if (!report.alerts.some((a) => a.severity === "critical")) return null;
+          return {
+            id: experiment.id,
+            productTitle: experiment.productTitle,
+            locale: experiment.locale,
+          };
+        } catch {
+          // Skip this experiment; the Experiments pages surface sync problems.
+          return null;
+        }
+      }),
+    )
+  ).filter((e): e is NonNullable<typeof e> => e !== null);
 
   const surfacesConfigured = settings.surfaces.some(
     (s) => s.enabled && s.selector.trim() !== "",

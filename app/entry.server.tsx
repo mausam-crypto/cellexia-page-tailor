@@ -8,7 +8,11 @@ import {
 import { isbot } from "isbot";
 import { addDocumentResponseHeaders } from "./shopify.server";
 
-export const streamTimeout = 5000;
+// How long the React SSR stream may take before it is aborted. The Remix
+// template default of 5s turns a slow render on a small/cold host into a
+// hard error page ("the app never loads") — give constrained instances
+// room to finish instead.
+export const streamTimeout = 20000;
 
 export default async function handleRequest(
   request: Request,
@@ -52,7 +56,7 @@ export default async function handleRequest(
       }
     );
 
-    // Automatically timeout the React renderer after 6 seconds, which ensures
+    // Abort the React renderer shortly after streamTimeout, which ensures
     // React has enough time to flush down the rejected boundary contents
     setTimeout(abort, streamTimeout + 1000);
   });

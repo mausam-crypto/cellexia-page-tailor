@@ -22,15 +22,22 @@ import {
 } from "@shopify/polaris";
 import { useAppBridge } from "@shopify/app-bridge-react";
 import { authenticate } from "../shopify.server";
-import { getShopLocales } from "../services/shopify-data.server";
+import {
+  getShopLocales,
+  getShopLocalesCached,
+} from "../services/shopify-data.server";
 import { createArticlesForProduct } from "../services/variant.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
-  const { admin } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   // A transient Admin API failure must degrade to an explanatory banner,
-  // not replace the whole page with an error boundary.
+  // not replace the whole page with an error boundary. Cached: after the
+  // first load this answers without a Shopify round trip (the action below
+  // still validates against a fresh fetch).
   try {
-    const locales = (await getShopLocales(admin)).filter((l) => l.published);
+    const locales = (
+      await getShopLocalesCached(admin, session.shop)
+    ).filter((l) => l.published);
     return { locales, localesUnavailable: false };
   } catch {
     return { locales: [], localesUnavailable: true };
