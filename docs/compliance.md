@@ -205,6 +205,36 @@ mode is set when the batch is created (and can be flipped per article before
 regeneration), so keeping the two funnels separate is an operational rule the
 team owns.
 
+### Brief-sourced variants (branded campaigns) are not grounded
+
+**At the merchant's explicit direction (2026-10-21), variants created from a
+written brief are free-written.** The grounding constraint above does not
+apply to them: the model writes what the brief asks for, drawing on the brief,
+any reference material the merchant pasted or linked, and the existing copy,
+and it may make claims the page never made. What remains in force:
+
+- The deterministic pattern checks (percentages, clinical language, drug-like
+  words, guarantees, rankings, urgency) run unchanged and flag as before.
+- The model guard still runs, with the brief and references as the sources:
+  claims it finds in none of the page copy, the brief, or the references are
+  stored per section as **unverified claims** and shown on the review page.
+  This is information for the reviewer, not a block.
+- The hard rules the brief cannot override: no drug-like language, no
+  attributes, images or links in the copy, the theme's interactive markup
+  preserved, never-touch selectors (price, reviews, structured data) enforced
+  at serve time exactly as for article variants.
+- The post-publication review model (next section) applies: a brief-based
+  page, including any unverified claim on it, can serve to real visitors
+  before anyone reads it. The links are private until an ad uses them, every
+  version is kept with one-click restore, and the master serving switch
+  remains the emergency stop.
+
+Serving is unchanged: a brief-based URL returns the same content to every
+visitor, so nothing in the cloaking argument above moves. What moves is the
+substantiation posture — a brief-based page's claims are substantiated by the
+merchant's own brief and references, which the team must keep defensible, not
+by the product page or a published article.
+
 Price, reviews, ratings, and structured data are never touched. This is
 enforced, not just promised: CSS selectors targeting price, review/rating,
 `itemprop`/`ld+json` structured data, canonical, or metadata/script elements

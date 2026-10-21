@@ -30,26 +30,37 @@ import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { getSettings } from "../services/settings.server";
 import { refreshFindings } from "../services/generate.server";
-import type {
-  ConversionPlan,
-  PersonaPriority,
-  ProofPoint,
-  SubtleInsertion,
-  SubtlePlan,
-  V2Plan,
-  V2PlanItem,
+import {
+  BRIEF_ADVANCED_FIELDS,
+  normalizeAdaptationMode,
+  normalizeBriefAdvanced,
+  type ConversionPlan,
+  type PersonaPriority,
+  type ProofPoint,
+  type SubtleInsertion,
+  type SubtlePlan,
+  type SurfaceSnapshot,
+  type V2Plan,
+  type V2PlanItem,
 } from "../services/types";
-import { normalizeAdaptationMode } from "../services/types";
 import {
   getPrimaryDomainUrlCached,
   getShopLocalesCached,
 } from "../services/shopify-data.server";
 import {
+  REFINEMENT_FAILED_PREFIX,
   buildVariantUrl,
+  duplicateArticle,
   isGenerationInFlight,
   isQueuedFresh,
   sanitizeAdaptedHtml,
 } from "../services/variant.server";
+import {
+  buildVersionCreate,
+  prepareVersion,
+  pruneVersions,
+  restoreVersion,
+} from "../services/versions.server";
 import {
   enqueueGeneration,
   kickGenerationQueue,
@@ -235,71 +246,113 @@ async function applyOverrideEdits(
     where: { articleId: article.id },
   });
   const updates = [];
+  // The post-edit state of every surface (edited or not), for the version
+  // snapshot, plus the labels of the surfaces the merchant touched.
+  const nextRows: SurfaceSnapshot[] = [];
+  const editedLabels: string[] = [];
   let changed = false;
   let findingsChanged = false;
   for (const o of overrides) {
     const adaptedRaw = formData.get(`adapted_${o.id}`);
     const enabledRaw = formData.get(`enabled_${o.id}`);
-    if (adaptedRaw === null && enabledRaw === null) continue;
     const data: {
       adapted?: string;
       enabled?: boolean;
       warnings?: string | null;
       articleClaims?: string | null;
     } = {};
-    const willBeEnabled = enabledRaw !== null ? enabledRaw === "true" : o.enabled;
-    if (enabledRaw !== null) {
-      const enabled = enabledRaw === "true";
-      if (enabled !== o.enabled) changed = true;
-      data.enabled = enabled;
-    }
-    if (adaptedRaw !== null) {
-      let adapted = String(adaptedRaw);
-      if (o.mode === "html") adapted = sanitizeAdaptedHtml(adapted);
-      const visibleText =
-        o.mode === "html" ? adapted.replace(/<[^>]*>/g, "").trim() : adapted.trim();
-      if (willBeEnabled && visibleText === "") {
-        return {
-          changed: false,
-          findingsChanged: false,
-          error: `"${o.label}" is empty. Untick "Include this surface" instead of clearing its text.`,
-        };
+    if (adaptedRaw !== null || enabledRaw !== null) {
+      const willBeEnabled =
+        enabledRaw !== null ? enabledRaw === "true" : o.enabled;
+      if (enabledRaw !== null) {
+        const enabled = enabledRaw === "true";
+        if (enabled !== o.enabled) {
+          changed = true;
+          data.enabled = enabled;
+        }
       }
-      if (adapted !== o.adapted) {
-        changed = true;
-        data.adapted = adapted;
-        const findings = refreshFindings(
-          {
-            warnings: parseJsonStringArray(o.warnings),
-            articleClaims: parseJsonStringArray(o.articleClaims),
-          },
-          o.original,
-          adapted,
-          {
-            articleText: article.sourceText ?? undefined,
-            metaMode: article.generatedMode === "meta",
-          },
-        );
-        data.warnings = findings.warnings.length
-          ? JSON.stringify(findings.warnings)
-          : null;
-        data.articleClaims = findings.articleClaims.length
-          ? JSON.stringify(findings.articleClaims)
-          : null;
-        if (
-          data.warnings !== o.warnings ||
-          data.articleClaims !== o.articleClaims
-        ) {
-          findingsChanged = true;
+      if (adaptedRaw !== null) {
+        let adapted = String(adaptedRaw);
+        if (o.mode === "html") adapted = sanitizeAdaptedHtml(adapted);
+        const visibleText =
+          o.mode === "html"
+            ? adapted.replace(/<[^>]*>/g, "").trim()
+            : adapted.trim();
+        if (willBeEnabled && visibleText === "") {
+          return {
+            changed: false,
+            findingsChanged: false,
+            error: `"${o.label}" is empty. Untick "Include this surface" instead of clearing its text.`,
+          };
+        }
+        if (adapted !== o.adapted) {
+          changed = true;
+          data.adapted = adapted;
+          const findings = refreshFindings(
+            {
+              warnings: parseJsonStringArray(o.warnings),
+              articleClaims: parseJsonStringArray(o.articleClaims),
+            },
+            o.original,
+            adapted,
+            {
+              articleText: article.sourceText ?? undefined,
+              metaMode: article.generatedMode === "meta",
+            },
+          );
+          data.warnings = findings.warnings.length
+            ? JSON.stringify(findings.warnings)
+            : null;
+          data.articleClaims = findings.articleClaims.length
+            ? JSON.stringify(findings.articleClaims)
+            : null;
+          if (
+            data.warnings !== o.warnings ||
+            data.articleClaims !== o.articleClaims
+          ) {
+            findingsChanged = true;
+          }
         }
       }
     }
-    if (Object.keys(data).length > 0) {
+    nextRows.push({
+      surfaceKey: o.surfaceKey,
+      label: o.label,
+      selector: o.selector,
+      mode: o.mode,
+      original: o.original,
+      adapted: data.adapted ?? o.adapted,
+      notes: o.notes,
+      warnings: data.warnings !== undefined ? data.warnings : o.warnings,
+      articleClaims:
+        data.articleClaims !== undefined ? data.articleClaims : o.articleClaims,
+      unverifiedClaims: o.unverifiedClaims,
+      enabled: data.enabled ?? o.enabled,
+    });
+    if (data.adapted !== undefined || data.enabled !== undefined) {
+      editedLabels.push(o.label);
       updates.push(prisma.override.update({ where: { id: o.id }, data }));
     }
   }
   if (updates.length > 0) {
-    await prisma.$transaction(updates);
+    // Version history: a hand edit is an event like any other. The
+    // snapshot is the post-edit state; the instruction names what moved.
+    const { number, previousSnapshot } = await prepareVersion(
+      article.id,
+      overrides,
+    );
+    await prisma.$transaction([
+      ...updates,
+      buildVersionCreate({
+        articleId: article.id,
+        number,
+        kind: "edit",
+        instruction: `Edited: ${editedLabels.join(", ")}`,
+        snapshot: nextRows,
+        previousSnapshot,
+      }),
+    ]);
+    await pruneVersions(article.id);
   }
   return { changed, findingsChanged, error: null };
 }
@@ -346,16 +399,33 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   // Restart recovery for the background generation queue; no-op when idle.
   kickGenerationQueue();
 
-  const [article, settings] = await Promise.all([
+  const [article, settings, versions] = await Promise.all([
     prisma.article.findFirst({
       where: { id: params.id, shop },
       include: { overrides: { orderBy: { surfaceKey: "asc" } } },
     }),
     getSettings(shop),
+    // Metadata only: snapshots are large and only Restore needs them.
+    prisma.variantVersion.findMany({
+      where: { articleId: params.id ?? "" },
+      orderBy: { number: "desc" },
+      select: {
+        number: true,
+        kind: true,
+        instruction: true,
+        modelNotes: true,
+        runWarnings: true,
+        changedSurfaces: true,
+        restoredFrom: true,
+        createdAt: true,
+      },
+    }),
   ]);
   if (!article) {
     throw new Response("Article not found", { status: 404 });
   }
+  const refinementFailed =
+    article.errorMessage?.startsWith(REFINEMENT_FAILED_PREFIX) ?? false;
 
   // The page's core job (review + approve/unapprove, both local-DB actions)
   // must survive a flaky Admin API: degrade to locale codes and hide the
@@ -393,7 +463,16 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       locale: article.locale,
       localeName,
       status: article.status,
-      errorMessage: article.errorMessage,
+      errorMessage: refinementFailed
+        ? (article.errorMessage ?? "").slice(REFINEMENT_FAILED_PREFIX.length)
+        : article.errorMessage,
+      refinementFailed,
+      sourceKind: article.sourceKind,
+      briefName: article.briefName,
+      briefText: article.briefText,
+      briefReferences: article.briefReferences,
+      briefAdvanced: normalizeBriefAdvanced(article.briefAdvanced),
+      pendingRefinement: article.pendingRefinement,
       sourceUrl: article.sourceUrl,
       sourceTitle: article.sourceTitle,
       detectedQuery: article.detectedQuery,
@@ -423,6 +502,17 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       enabled: o.enabled,
       warnings: parseJsonStringArray(o.warnings),
       articleClaims: parseJsonStringArray(o.articleClaims),
+      unverifiedClaims: parseJsonStringArray(o.unverifiedClaims),
+    })),
+    versions: versions.map((v) => ({
+      number: v.number,
+      kind: v.kind,
+      instruction: v.instruction,
+      modelNotes: v.modelNotes,
+      runWarnings: parseJsonStringArray(v.runWarnings),
+      changedSurfaces: parseJsonStringArray(v.changedSurfaces),
+      restoredFrom: v.restoredFrom,
+      createdAt: v.createdAt.toISOString(),
     })),
     variantUrl,
   };
@@ -473,7 +563,107 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     };
   }
 
+  if (intent === "refine") {
+    if (article.sourceKind !== "brief") {
+      return { ok: false, intent, error: "Only brief-based pages can be refined." };
+    }
+    const instruction = String(formData.get("instruction") ?? "").trim();
+    if (!instruction) {
+      return { ok: false, intent, error: "Type what should change first." };
+    }
+    if (instruction.length > 4000) {
+      return { ok: false, intent, error: "Keep the instruction under 4,000 characters." };
+    }
+    if (isGenerationBusy(article)) {
+      return { ok: false, intent, error: GENERATING_ERROR };
+    }
+    // The instruction was written against the copy on screen.
+    if (!(await overridesMatchForm(article.id, formData))) {
+      return { ok: false, intent, error: STALE_COPY_ERROR };
+    }
+    const count = await prisma.override.count({
+      where: { articleId: article.id },
+    });
+    if (count === 0) {
+      return { ok: false, intent, error: "Generate the page first, then refine it." };
+    }
+    const { queued } = await enqueueGeneration(shop, [article.id], {
+      refinement: instruction,
+    });
+    if (queued === 0) {
+      return { ok: false, intent, error: "Already generating or queued." };
+    }
+    return { ok: true, intent, error: null };
+  }
+
+  if (intent === "saveBrief") {
+    if (article.sourceKind !== "brief") {
+      return { ok: false, intent, error: "Only brief-based pages have a brief." };
+    }
+    const name = String(formData.get("name") ?? "").trim();
+    const text = String(formData.get("text") ?? "").trim();
+    const references = String(formData.get("references") ?? "").trim();
+    if (!name) return { ok: false, intent, error: "The brief needs a name." };
+    if (!text) return { ok: false, intent, error: "The brief text cannot be empty." };
+    if (name.length > 120 || text.length > 20_000 || references.length > 60_000) {
+      return { ok: false, intent, error: "The brief, its name or its references are too long." };
+    }
+    const advancedRaw: Record<string, string> = {};
+    for (const { key } of BRIEF_ADVANCED_FIELDS) {
+      advancedRaw[key] = String(formData.get(`advanced_${key}`) ?? "").slice(0, 2000);
+    }
+    const advanced = normalizeBriefAdvanced(advancedRaw);
+    await prisma.article.update({
+      where: { id: article.id },
+      data: {
+        briefName: name,
+        briefText: text,
+        briefReferences: references || null,
+        briefAdvanced:
+          Object.keys(advanced).length > 0 ? JSON.stringify(advanced) : null,
+      },
+    });
+    return { ok: true, intent, error: null };
+  }
+
+  if (intent === "restore") {
+    if (isGenerationBusy(article)) {
+      return { ok: false, intent, error: GENERATING_ERROR };
+    }
+    const number = Number(formData.get("version"));
+    if (!Number.isInteger(number) || number < 1) {
+      return { ok: false, intent, error: "Unknown version." };
+    }
+    try {
+      await restoreVersion(shop, article.id, number);
+    } catch (error) {
+      return {
+        ok: false,
+        intent,
+        error: error instanceof Error ? error.message : "Could not restore that version.",
+      };
+    }
+    return { ok: true, intent, error: null, restored: number };
+  }
+
+  if (intent === "duplicate") {
+    let newId: string;
+    try {
+      newId = await duplicateArticle(shop, article.id);
+    } catch (error) {
+      return {
+        ok: false,
+        intent,
+        error: error instanceof Error ? error.message : "Could not duplicate.",
+      };
+    }
+    return redirect(`/app/articles/${newId}`);
+  }
+
   if (intent === "setMode") {
+    if (article.sourceKind === "brief") {
+      return { ok: false, intent, error: "Brief-based pages have no adaptation mode." };
+    }
     // Only affects the next generation: the stored (possibly live) copy was
     // produced under the previous mode and keeps serving unchanged.
     const requested = String(formData.get("mode") ?? "standard");
@@ -584,6 +774,23 @@ function statusBadge(status: string, reviewedAt: string | null) {
   }
 }
 
+function versionKindBadge(kind: string) {
+  switch (kind) {
+    case "refine":
+      return <Badge tone="magic">Refined</Badge>;
+    case "edit":
+      return <Badge tone="info">Edited</Badge>;
+    case "restore":
+      return <Badge tone="attention">Restored</Badge>;
+    case "duplicate":
+      return <Badge>Duplicated</Badge>;
+    default:
+      return <Badge tone="success">Generated</Badge>;
+  }
+}
+
+const URL_LINE = /^https?:\/\/\S+$/i;
+
 export default function ArticleReview() {
   const {
     article,
@@ -596,6 +803,7 @@ export default function ArticleReview() {
     v2Plan,
     subtlePlan,
     overrides,
+    versions,
     variantUrl,
   } = useLoaderData<typeof loader>();
   const shopify = useAppBridge();
@@ -604,14 +812,40 @@ export default function ArticleReview() {
   const saveFetcher = useFetcher<typeof action>();
   const reviewFetcher = useFetcher<typeof action>();
   const modeFetcher = useFetcher<typeof action>();
+  const refineFetcher = useFetcher<typeof action>();
+  const briefFetcher = useFetcher<typeof action>();
+  const restoreFetcher = useFetcher<typeof action>();
+  const duplicateFetcher = useFetcher<typeof action>();
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
+  const [restoreTarget, setRestoreTarget] = useState<number | null>(null);
+  const [refineText, setRefineText] = useState("");
+  const [briefEditing, setBriefEditing] = useState(false);
+
+  const isBrief = article.sourceKind === "brief";
+
+  const makeBriefDraft = useCallback(
+    () => ({
+      name: article.briefName ?? "",
+      text: article.briefText ?? "",
+      references: article.briefReferences ?? "",
+      audience: article.briefAdvanced.audience ?? "",
+      keyMessage: article.briefAdvanced.keyMessage ?? "",
+      tone: article.briefAdvanced.tone ?? "",
+      mustSay: article.briefAdvanced.mustSay ?? "",
+      mustAvoid: article.briefAdvanced.mustAvoid ?? "",
+    }),
+    [article],
+  );
+  const [briefDraft, setBriefDraft] = useState(makeBriefDraft);
 
   // Busy either from this tab (enqueue request in flight) or from the
   // server-side queue/lock reported by the loader.
   const isGenerating =
     generateFetcher.state !== "idle" ||
+    refineFetcher.state !== "idle" ||
     article.generationInFlight ||
     article.queued;
+  const isRestoring = restoreFetcher.state !== "idle";
   const isReviewActing = reviewFetcher.state !== "idle";
   const overrideIds = overrides.map((o) => o.id).join(",");
   const revalidator = useRevalidator();
@@ -715,12 +949,102 @@ export default function ArticleReview() {
     }
   }, [modeFetcher.state, modeFetcher.data, shopify]);
 
+  useEffect(() => {
+    if (refineFetcher.state === "idle" && refineFetcher.data?.intent === "refine") {
+      if (!refineFetcher.data.ok && "error" in refineFetcher.data) {
+        shopify.toast.show(String(refineFetcher.data.error), { isError: true });
+      } else {
+        setRefineText("");
+        shopify.toast.show(
+          "Refinement started in the background — this page updates when it is done.",
+        );
+      }
+    }
+  }, [refineFetcher.state, refineFetcher.data, shopify]);
+
+  useEffect(() => {
+    if (briefFetcher.state === "idle" && briefFetcher.data?.intent === "saveBrief") {
+      if (!briefFetcher.data.ok && "error" in briefFetcher.data) {
+        shopify.toast.show(String(briefFetcher.data.error), { isError: true });
+      } else {
+        setBriefEditing(false);
+        shopify.toast.show(
+          "Brief saved — it applies to the next refinement or start over.",
+        );
+      }
+    }
+  }, [briefFetcher.state, briefFetcher.data, shopify]);
+
+  useEffect(() => {
+    if (restoreFetcher.state === "idle" && restoreFetcher.data?.intent === "restore") {
+      if (!restoreFetcher.data.ok && "error" in restoreFetcher.data) {
+        shopify.toast.show(String(restoreFetcher.data.error), { isError: true });
+      } else {
+        const restored =
+          "restored" in restoreFetcher.data ? restoreFetcher.data.restored : null;
+        shopify.toast.show(
+          restored
+            ? `Version #${restored} restored — live on the storefront within ~2 minutes`
+            : "Version restored",
+        );
+      }
+    }
+  }, [restoreFetcher.state, restoreFetcher.data, shopify]);
+
+  useEffect(() => {
+    if (
+      duplicateFetcher.state === "idle" &&
+      duplicateFetcher.data?.intent === "duplicate" &&
+      !duplicateFetcher.data.ok &&
+      "error" in duplicateFetcher.data
+    ) {
+      shopify.toast.show(String(duplicateFetcher.data.error), { isError: true });
+    }
+  }, [duplicateFetcher.state, duplicateFetcher.data, shopify]);
+
   const updateDraft = useCallback(
     (id: string, patch: Partial<{ adapted: string; enabled: boolean }>) => {
       setDrafts((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }));
     },
     [],
   );
+
+  const handleRefine = useCallback(() => {
+    const instruction = refineText.trim();
+    if (!instruction) return;
+    // overrideIds: the instruction was written against the copy on screen;
+    // the server rejects it if a background run has since replaced the rows.
+    refineFetcher.submit(
+      { intent: "refine", instruction, overrideIds },
+      { method: "POST" },
+    );
+  }, [refineText, overrideIds, refineFetcher]);
+
+  const handleDuplicate = useCallback(() => {
+    duplicateFetcher.submit({ intent: "duplicate" }, { method: "POST" });
+  }, [duplicateFetcher]);
+
+  const openBriefEditor = useCallback(() => {
+    setBriefDraft(makeBriefDraft());
+    setBriefEditing(true);
+  }, [makeBriefDraft]);
+
+  const handleSaveBrief = useCallback(() => {
+    briefFetcher.submit(
+      {
+        intent: "saveBrief",
+        name: briefDraft.name,
+        text: briefDraft.text,
+        references: briefDraft.references,
+        advanced_audience: briefDraft.audience,
+        advanced_keyMessage: briefDraft.keyMessage,
+        advanced_tone: briefDraft.tone,
+        advanced_mustSay: briefDraft.mustSay,
+        advanced_mustAvoid: briefDraft.mustAvoid,
+      },
+      { method: "POST" },
+    );
+  }, [briefDraft, briefFetcher]);
 
   const handleGenerate = useCallback(() => {
     generateFetcher.submit({ intent: "generate" }, { method: "POST" });
@@ -751,8 +1075,18 @@ export default function ArticleReview() {
   // Flagged findings drive the urgency of the review notification.
   const hasBlockingWarnings = overrides.some((o) => o.warnings.length > 0);
   const hasFlagged = overrides.some(
-    (o) => o.warnings.length > 0 || o.articleClaims.length > 0,
+    (o) =>
+      o.warnings.length > 0 ||
+      o.articleClaims.length > 0 ||
+      o.unverifiedClaims.length > 0,
   );
+  // A refinement works on the SAVED copy and replaces the rows when it
+  // lands, which would wipe unsaved typing: ask for a save first.
+  const hasUnsavedEdits = overrides.some((o) => {
+    const d = drafts[o.id];
+    return d !== undefined && (d.adapted !== o.adapted || d.enabled !== o.enabled);
+  });
+  const latestRunWarnings = versions[0]?.runWarnings ?? [];
 
   const isLive = article.status === "approved";
   const needsReview = isLive && !article.reviewedAt;
@@ -760,10 +1094,15 @@ export default function ArticleReview() {
   return (
     <Page
       backAction={{ url: "/app" }}
-      title={`${article.productTitle} · ${article.locale}`}
+      title={
+        isBrief
+          ? `${article.briefName ?? "Brief"} · ${article.productTitle} · ${article.locale}`
+          : `${article.productTitle} · ${article.locale}`
+      }
       titleMetadata={
         <InlineStack gap="100">
           {statusBadge(article.status, article.reviewedAt)}
+          {isBrief && <Badge tone="info">Brief</Badge>}
           {article.mode === "subtle" && (
             <Badge tone="magic">Subtle intent</Badge>
           )}
@@ -780,9 +1119,21 @@ export default function ArticleReview() {
       }
       secondaryActions={[
         {
-          content: "Regenerate",
+          content: isBrief ? "Start over" : "Regenerate",
           disabled: isGenerating,
           onAction: handleGenerate,
+        },
+        {
+          content: "Duplicate",
+          disabled: isGenerating || duplicateFetcher.state !== "idle",
+          onAction: handleDuplicate,
+        },
+        {
+          content: "View on storefront",
+          disabled: !variantUrl,
+          onAction: () => {
+            if (variantUrl) window.open(variantUrl, "_blank", "noopener");
+          },
         },
         {
           content: "Delete",
@@ -790,7 +1141,7 @@ export default function ArticleReview() {
           onAction: () => setDeleteModalOpen(true),
         },
       ]}
-      actionGroups={[
+      actionGroups={isBrief ? undefined : [
         {
           title: `Mode: ${article.mode === "meta" ? "Meta" : article.mode === "ultra" ? "Ultra" : article.mode === "persona" ? "Persona" : article.mode === "max" ? "Max" : article.mode === "v2" ? "V2" : article.mode === "subtle" ? "Subtle" : "Standard"}`,
           actions: (
@@ -836,9 +1187,36 @@ export default function ArticleReview() {
           <BlockStack gap="400">
             {isGenerating &&
               (article.queued && !article.generationInFlight ? (
-                <Banner tone="info" title="Queued for generation">
-                  Starting momentarily. Runs in the background on the server -
-                  you can leave this page; it updates automatically.
+                <Banner
+                  tone="info"
+                  title={
+                    article.pendingRefinement
+                      ? "Queued for refinement"
+                      : "Queued for generation"
+                  }
+                >
+                  {article.pendingRefinement
+                    ? `"${article.pendingRefinement}" starts momentarily.`
+                    : "Starting momentarily."}{" "}
+                  Runs in the background on the server - you can leave this
+                  page; it updates automatically.
+                </Banner>
+              ) : article.pendingRefinement ? (
+                <Banner tone="info" title="Refining — this takes a minute or two.">
+                  Applying &ldquo;{article.pendingRefinement}&rdquo; to the
+                  current copy, then checking the changed sections. The live
+                  copy stays as it is until the refinement succeeds. You can
+                  leave this page; it updates automatically.
+                </Banner>
+              ) : isBrief ? (
+                <Banner
+                  tone="info"
+                  title="Writing the page from the brief — this takes a minute or two."
+                >
+                  The brief is applied to the page&apos;s copy and the result
+                  is checked for unsupported claims, in two model passes
+                  running in the background on the server. You can leave this
+                  page; it updates automatically when it&apos;s done.
                 </Banner>
               ) : (
                 <Banner tone="info" title="Generating — this takes a minute or two.">
@@ -858,14 +1236,40 @@ export default function ArticleReview() {
                 </BlockStack>
               </Banner>
             )}
-            {article.status === "approved" &&
+            {article.refinementFailed &&
               article.errorMessage &&
               !isGenerating && (
-                <Banner tone="warning" title="Last regeneration failed">
+                <Banner tone="warning" title="Last refinement failed">
+                  {article.errorMessage} — the copy was left exactly as it
+                  was. Rephrase the instruction and try again.
+                </Banner>
+              )}
+            {article.status === "approved" &&
+              article.errorMessage &&
+              !article.refinementFailed &&
+              !isGenerating && (
+                <Banner
+                  tone="warning"
+                  title={
+                    isBrief ? "Last start over failed" : "Last regeneration failed"
+                  }
+                >
                   {article.errorMessage} — the variant is still live and
                   serving the previously approved copy.
                 </Banner>
               )}
+            {latestRunWarnings.length > 0 && !isGenerating && (
+              <Banner
+                tone="warning"
+                title="Some reference material could not be read"
+              >
+                <List type="bullet">
+                  {latestRunWarnings.map((warning, index) => (
+                    <List.Item key={index}>{warning}</List.Item>
+                  ))}
+                </List>
+              </Banner>
+            )}
             {reviewError && (
               <Banner tone="critical" title="Action failed">
                 {String(reviewError)}
@@ -911,7 +1315,9 @@ export default function ArticleReview() {
                     {hasBlockingWarnings
                       ? "This variant went live automatically after generation and some of its claims were flagged by the guard. Check the flagged items below; take the variant offline if anything is wrong."
                       : hasFlagged
-                        ? "This variant went live automatically after generation. It includes article-sourced claims listed below - verify the article really supports them."
+                        ? isBrief
+                          ? "This page went live automatically. It makes claims listed below that go beyond the original copy - check that each one holds up before marking it reviewed."
+                          : "This variant went live automatically after generation. It includes article-sourced claims listed below - verify the article really supports them."
                         : "This variant went live automatically after generation. Skim the copy below and mark it reviewed."}
                   </Text>
                   <InlineStack gap="200">
@@ -1000,27 +1406,158 @@ export default function ArticleReview() {
               </Banner>
             )}
 
-            <Card>
-              <BlockStack gap="200">
-                <Text as="h2" variant="headingMd">
-                  Source
-                </Text>
-                {article.sourceUrl ? (
-                  <Link url={article.sourceUrl} target="_blank">
-                    {article.sourceTitle ?? article.sourceUrl}
-                  </Link>
-                ) : (
-                  <Text as="p" variant="bodyMd">
-                    {article.sourceTitle
-                      ? `${article.sourceTitle} (pasted content)`
-                      : "(pasted content)"}
+            {isBrief ? (
+              <Card>
+                <BlockStack gap="300">
+                  <InlineStack align="space-between" blockAlign="center">
+                    <Text as="h2" variant="headingMd">
+                      Brief
+                    </Text>
+                    {!briefEditing && (
+                      <Button
+                        size="slim"
+                        onClick={openBriefEditor}
+                        disabled={isGenerating}
+                      >
+                        Edit brief
+                      </Button>
+                    )}
+                  </InlineStack>
+                  {briefEditing ? (
+                    <BlockStack gap="300">
+                      <TextField
+                        label="Name"
+                        value={briefDraft.name}
+                        onChange={(value) =>
+                          setBriefDraft((d) => ({ ...d, name: value }))
+                        }
+                        autoComplete="off"
+                        maxLength={120}
+                      />
+                      <TextField
+                        label="Brief"
+                        value={briefDraft.text}
+                        onChange={(value) =>
+                          setBriefDraft((d) => ({ ...d, text: value }))
+                        }
+                        multiline={8}
+                        autoComplete="off"
+                      />
+                      <TextField
+                        label="References (optional)"
+                        value={briefDraft.references}
+                        onChange={(value) =>
+                          setBriefDraft((d) => ({ ...d, references: value }))
+                        }
+                        multiline={5}
+                        autoComplete="off"
+                        helpText="Pasted text and/or one link per line; links are read again on every refinement or start over."
+                      />
+                      {BRIEF_ADVANCED_FIELDS.map(({ key, label }) => (
+                        <TextField
+                          key={key}
+                          label={label}
+                          value={briefDraft[key]}
+                          onChange={(value) =>
+                            setBriefDraft((d) => ({ ...d, [key]: value }))
+                          }
+                          multiline={key === "mustSay" || key === "mustAvoid" ? 2 : undefined}
+                          autoComplete="off"
+                          maxLength={2000}
+                        />
+                      ))}
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        Saving the brief changes nothing on the page by itself:
+                        it applies to the next refinement, or when you start
+                        over.
+                      </Text>
+                      <InlineStack gap="200" align="end">
+                        <Button onClick={() => setBriefEditing(false)}>
+                          Cancel
+                        </Button>
+                        <Button
+                          variant="primary"
+                          loading={briefFetcher.state !== "idle"}
+                          onClick={handleSaveBrief}
+                        >
+                          Save brief
+                        </Button>
+                      </InlineStack>
+                    </BlockStack>
+                  ) : (
+                    <BlockStack gap="200">
+                      <Text as="p" variant="bodyMd" fontWeight="semibold">
+                        {article.briefName}
+                      </Text>
+                      <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+                        {article.briefText}
+                      </div>
+                      {article.briefReferences && (
+                        <BlockStack gap="100">
+                          <Text as="h3" variant="headingSm" tone="subdued">
+                            References
+                          </Text>
+                          <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+                            {article.briefReferences.split(/\r?\n/).map((line, index) =>
+                              URL_LINE.test(line.trim()) ? (
+                                <div key={index}>
+                                  <Link url={line.trim()} target="_blank">
+                                    {line.trim()}
+                                  </Link>
+                                </div>
+                              ) : (
+                                <div key={index}>{line || " "}</div>
+                              ),
+                            )}
+                          </div>
+                        </BlockStack>
+                      )}
+                      {BRIEF_ADVANCED_FIELDS.some(
+                        ({ key }) => article.briefAdvanced[key],
+                      ) && (
+                        <BlockStack gap="100">
+                          {BRIEF_ADVANCED_FIELDS.filter(
+                            ({ key }) => article.briefAdvanced[key],
+                          ).map(({ key, label }) => (
+                            <Text as="p" variant="bodySm" key={key}>
+                              <Text as="span" fontWeight="semibold">
+                                {label}:{" "}
+                              </Text>
+                              {article.briefAdvanced[key]}
+                            </Text>
+                          ))}
+                        </BlockStack>
+                      )}
+                      <Text as="p" tone="subdued" variant="bodySm">
+                        Language: {article.localeName} ({article.locale})
+                      </Text>
+                    </BlockStack>
+                  )}
+                </BlockStack>
+              </Card>
+            ) : (
+              <Card>
+                <BlockStack gap="200">
+                  <Text as="h2" variant="headingMd">
+                    Source
                   </Text>
-                )}
-                <Text as="p" tone="subdued" variant="bodySm">
-                  Language: {article.localeName} ({article.locale})
-                </Text>
-              </BlockStack>
-            </Card>
+                  {article.sourceUrl ? (
+                    <Link url={article.sourceUrl} target="_blank">
+                      {article.sourceTitle ?? article.sourceUrl}
+                    </Link>
+                  ) : (
+                    <Text as="p" variant="bodyMd">
+                      {article.sourceTitle
+                        ? `${article.sourceTitle} (pasted content)`
+                        : "(pasted content)"}
+                    </Text>
+                  )}
+                  <Text as="p" tone="subdued" variant="bodySm">
+                    Language: {article.localeName} ({article.locale})
+                  </Text>
+                </BlockStack>
+              </Card>
+            )}
 
             {article.mode === "subtle" && article.status === "pending" && (
               <Banner tone="info" title="Subtle intent article">
@@ -1084,7 +1621,7 @@ export default function ArticleReview() {
               </Banner>
             )}
 
-            {article.detectedQuery && (
+            {!isBrief && article.detectedQuery && (
               <Card>
                 <BlockStack gap="300">
                   <Text as="h2" variant="headingMd">
@@ -1401,9 +1938,9 @@ export default function ArticleReview() {
                     Not generated yet
                   </Text>
                   <Text as="p" variant="bodyMd">
-                    Generate the adapted copy for this article. The variant
-                    goes live automatically once generated (while serving is
-                    on), and you review it here afterwards.
+                    {isBrief
+                      ? "Write the page from the brief. It goes live automatically once generated (while serving is on), and you review and refine it here afterwards."
+                      : "Generate the adapted copy for this article. The variant goes live automatically once generated (while serving is on), and you review it here afterwards."}
                   </Text>
                   <InlineStack>
                     <Button
@@ -1447,10 +1984,31 @@ export default function ArticleReview() {
                         </List>
                       </Banner>
                     )}
+                    {o.unverifiedClaims.length > 0 && (
+                      <Banner tone="info" title="Unverified claims">
+                        <BlockStack gap="150">
+                          <List type="bullet">
+                            {o.unverifiedClaims.map((claim, index) => (
+                              <List.Item key={index}>{claim}</List.Item>
+                            ))}
+                          </List>
+                          <Text as="p" variant="bodySm">
+                            The checker found these in neither the page copy,
+                            the brief, nor the references. Check each one
+                            before marking the page reviewed; edit or refine
+                            the copy if anything does not hold up.
+                          </Text>
+                        </BlockStack>
+                      </Banner>
+                    )}
                     {o.articleClaims.length > 0 && (
                       <Banner
                         tone="info"
-                        title="New claims grounded in the article"
+                        title={
+                          isBrief
+                            ? "New claims from the brief or references"
+                            : "New claims grounded in the article"
+                        }
                       >
                         <BlockStack gap="150">
                           <List type="bullet">
@@ -1459,9 +2017,9 @@ export default function ArticleReview() {
                             ))}
                           </List>
                           <Text as="p" variant="bodySm">
-                            The original copy does not make these claims — the
-                            article does. Verify the article really supports
-                            each one; marking the variant reviewed covers them.
+                            {isBrief
+                              ? "The original copy does not make these claims; your brief or references do. Marking the page reviewed covers them."
+                              : "The original copy does not make these claims — the article does. Verify the article really supports each one; marking the variant reviewed covers them."}
                           </Text>
                         </BlockStack>
                       </Banner>
@@ -1543,9 +2101,173 @@ export default function ArticleReview() {
                 </BlockStack>
               </Card>
             )}
+
+            {isBrief && overrides.length > 0 && !isGenerating && (
+              <Card>
+                <BlockStack gap="300">
+                  <Text as="h2" variant="headingMd">
+                    Refine with a prompt
+                  </Text>
+                  <TextField
+                    label="What should change?"
+                    labelHidden
+                    value={refineText}
+                    onChange={setRefineText}
+                    multiline={3}
+                    autoComplete="off"
+                    placeholder="e.g. Shorten the FAQ to the four most relevant questions, and make the Science headline about molecular size"
+                    maxLength={4000}
+                  />
+                  <InlineStack align="space-between" blockAlign="center" gap="300">
+                    <Text
+                      as="p"
+                      variant="bodySm"
+                      tone={hasUnsavedEdits ? "caution" : "subdued"}
+                    >
+                      {hasUnsavedEdits
+                        ? "Save your edits first: a refinement works on the saved copy and would discard unsaved typing."
+                        : "Only what you ask for changes; everything else stays as it is, hand edits included. The new copy goes live within about 2 minutes and comes back as “Live — review needed”."}
+                    </Text>
+                    <Button
+                      variant="primary"
+                      loading={refineFetcher.state !== "idle"}
+                      disabled={
+                        !refineText.trim() ||
+                        isGenerating ||
+                        isSaving ||
+                        hasUnsavedEdits
+                      }
+                      onClick={handleRefine}
+                    >
+                      Refine
+                    </Button>
+                  </InlineStack>
+                </BlockStack>
+              </Card>
+            )}
+
+            {versions.length > 0 && (
+              <Card>
+                <BlockStack gap="300">
+                  <Text as="h2" variant="headingMd">
+                    Version history
+                  </Text>
+                  <Text as="p" tone="subdued" variant="bodySm">
+                    Every generation, refinement, edit and restore is kept.
+                    Restoring replaces the live copy immediately (storefront
+                    within about 2 minutes) and keeps the current copy as a
+                    new version, so a restore can itself be undone.
+                  </Text>
+                  <BlockStack gap="200">
+                    {versions.map((version, index) => (
+                      <Box
+                        key={version.number}
+                        padding="300"
+                        background="bg-surface-secondary"
+                        borderRadius="200"
+                      >
+                        <InlineStack
+                          align="space-between"
+                          blockAlign="start"
+                          wrap={false}
+                          gap="300"
+                        >
+                          <BlockStack gap="100">
+                            <InlineStack gap="150" blockAlign="center" wrap>
+                              <Text as="span" variant="bodyMd" fontWeight="semibold">
+                                #{version.number}
+                              </Text>
+                              {versionKindBadge(version.kind)}
+                              {index === 0 && <Badge tone="success">Current</Badge>}
+                              <Text as="span" variant="bodySm" tone="subdued">
+                                {new Date(version.createdAt).toLocaleString()}
+                              </Text>
+                            </InlineStack>
+                            {version.restoredFrom ? (
+                              <Text as="p" variant="bodySm">
+                                Restored version #{version.restoredFrom}
+                              </Text>
+                            ) : null}
+                            {version.instruction && (
+                              <Text as="p" variant="bodySm">
+                                {version.instruction}
+                              </Text>
+                            )}
+                            {version.modelNotes && (
+                              <Text as="p" variant="bodySm" tone="subdued">
+                                {version.modelNotes.length > 280
+                                  ? `${version.modelNotes.slice(0, 280)}…`
+                                  : version.modelNotes}
+                              </Text>
+                            )}
+                            {version.changedSurfaces.length > 0 &&
+                              version.kind !== "generate" && (
+                                <Text as="p" variant="bodySm" tone="subdued">
+                                  Changed: {version.changedSurfaces.join(", ")}
+                                </Text>
+                              )}
+                            {version.runWarnings.length > 0 && (
+                              <Text as="p" variant="bodySm" tone="caution">
+                                {version.runWarnings.length === 1
+                                  ? "One reference could not be read."
+                                  : `${version.runWarnings.length} references could not be read.`}
+                              </Text>
+                            )}
+                          </BlockStack>
+                          {index !== 0 && (
+                            <Button
+                              size="slim"
+                              disabled={isGenerating || isRestoring || isSaving}
+                              onClick={() => setRestoreTarget(version.number)}
+                            >
+                              Restore
+                            </Button>
+                          )}
+                        </InlineStack>
+                      </Box>
+                    ))}
+                  </BlockStack>
+                </BlockStack>
+              </Card>
+            )}
           </BlockStack>
         </Layout.Section>
       </Layout>
+      <Modal
+        open={restoreTarget !== null}
+        onClose={() => setRestoreTarget(null)}
+        title={`Restore version #${restoreTarget ?? ""}?`}
+        primaryAction={{
+          content: "Restore",
+          onAction: () => {
+            if (restoreTarget !== null) {
+              restoreFetcher.submit(
+                { intent: "restore", version: String(restoreTarget) },
+                { method: "POST" },
+              );
+            }
+            setRestoreTarget(null);
+          },
+        }}
+        secondaryActions={[
+          { content: "Cancel", onAction: () => setRestoreTarget(null) },
+        ]}
+      >
+        <Modal.Section>
+          <BlockStack gap="200">
+            <Text as="p">
+              The copy from that version replaces the current copy. The
+              current copy is kept as a new version, so you can switch back.
+            </Text>
+            {article.status === "approved" && (
+              <Text as="p" tone="caution">
+                This variant is live: the restored copy reaches the storefront
+                within about 2 minutes.
+              </Text>
+            )}
+          </BlockStack>
+        </Modal.Section>
+      </Modal>
       <Modal
         open={deleteModalOpen}
         onClose={() => setDeleteModalOpen(false)}

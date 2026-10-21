@@ -1,13 +1,14 @@
 # Page Tailor
 
-Per-article product-page copy variants for Cellexia's advertorial funnel.
+Per-article and per-brief product-page copy variants for Cellexia's funnels.
 
 The marketing team drives AdWords traffic to editorial "top 5" articles that link to
-Cellexia product pages. For each article, Page Tailor generates an **approved,
-per-article variant** of the product page copy and serves it via a URL parameter
-(e.g. `?cx=a7k2m9x4`). One URL per article. The Shopify product itself is **never
-modified** — variants live only in the app's database and are swapped in
-client-side by a theme app embed.
+Cellexia product pages. For each article, Page Tailor generates a
+**per-article variant** of the product page copy and serves it via a URL parameter
+(e.g. `?cx=a7k2m9x4`). One URL per article. For branded campaigns with no
+article, a written **brief** does the same job (see [Briefs](#briefs-branded-campaigns)).
+The Shopify product itself is **never modified** — variants live only in the
+app's database and are swapped in client-side by a theme app embed.
 
 There is no user-agent,
 referrer, or bot branching anywhere in the pipeline — deterministic per-URL
@@ -30,16 +31,17 @@ Article URL added in admin (per product, per language)
         v
 Claude reads the article
   - infers the target search query (with evidence)
-  - adapts the enabled copy surfaces (description, Accentuate metafields)
-    constrained to RE-EMPHASIZE existing copy -- no new claims allowed
+  - adapts the enabled copy surfaces (description, live page regions,
+    Accentuate metafields) using only claims the page or the article supports
         |
         v
 Claim guard (independent model pass + deterministic heuristics)
   flags anything new: percentages, clinical language, guarantees,
-  rankings, urgency -> warnings block approval until a human clears them
+  rankings, urgency -> findings shown for post-publication review
         |
         v
-Human review in the admin UI -> Approve
+Live automatically -> human review in the admin UI
+  (mark reviewed, edit, or take offline; every change is kept as a version)
         |
         v
 Variant URL:  https://shop.example/products/handle?cx=<opaque-8-char>
@@ -107,7 +109,8 @@ descriptions run Medium or Deep.
 ## Team workflow
 
 1. **Add** the list of article URLs for a product, per language (or paste the
-   article text if the URL can't be fetched).
+   article text if the URL can't be fetched) — or add **briefs** for a branded
+   campaign (see below).
 2. **Generate** — Claude infers the target query and adapts the enabled surfaces.
 3. **Live automatically** — the variant goes live the moment generation
    succeeds (while the master serving switch is on). The dashboard notifies
@@ -115,9 +118,50 @@ descriptions run Medium or Deep.
 4. **Review** — read the adapted copy side by side with the original, check any
    claim-guard flags, then **Mark as reviewed** — or **Take offline** with one
    click (stops serving within ~2–4 minutes across proxy + client caches).
-   Edits to a live variant apply to the storefront on the same timeline.
+   Edits to a live variant apply to the storefront on the same timeline, and
+   every change is kept in the variant's **version history** (one-click
+   restore).
 5. **Copy URL** — the app builds the full storefront URL for the right locale.
 6. **Paste** the URL into the article's CTA link.
+
+## Briefs (branded campaigns)
+
+For branded ads there is no article to feed the tool. **Add briefs** takes a
+written brief instead: pick a product, tick one or more languages, and add as
+many briefs as you like — each with a name, the brief itself, optional
+references (pasted text and/or one link per line) and optional Advanced fields
+(audience, key message, tone, must say, must avoid). Each brief × language
+becomes its own variant with its own URL, generated in the background and live
+automatically, exactly like article variants.
+
+Brief-based pages differ from article-based ones in three ways:
+
+- **Free writing.** The copy is written to the brief; it is not limited to
+  facts already on the page. The claim guard still runs: risky wording
+  patterns (drug-like words, guarantees, percentages, rankings, urgency) are
+  flagged as before, and claims the checker finds in neither the page, the
+  brief, nor the references are listed per section as **Unverified claims**.
+  Nothing blocks; this is review information.
+- **Refine with a prompt.** On the review page, type what should change
+  ("shorten the FAQ", "make the Science headline about molecular size"). The
+  model edits the current copy — hand edits included — and leaves everything
+  else untouched; the result goes live and comes back as "Live — review
+  needed". **Edit brief** changes the brief for the next refinement; **Start
+  over** rewrites the page from the base copy with the current brief.
+- **Default reach.** Unless the brief says otherwise, each region keeps its
+  structure, roughly its length (it may grow by about a third) and the brand
+  voice, and regions the angle does not concern are left unchanged.
+
+Two features arrived with briefs and apply to every variant, articles
+included:
+
+- **Version history.** Each generation, refinement, hand edit and restore is
+  kept as a version on the review page. Any version can be restored with one
+  click; the current copy is kept as a new version, so a restore can itself
+  be undone.
+- **Duplicate.** Creates a copy of a variant with a fresh URL — brief, copy and
+  history included — so you can iterate on the copy while an ad keeps pointing
+  at the original, or spin a sibling angle off a page you like.
 
 ## Experiment tracker
 

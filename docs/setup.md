@@ -237,3 +237,42 @@ Honestly:
 | Experiment shows no views | App embed not enabled, or enabled after the baseline window began | Enable the embed; views only accrue from that moment — for baseline coverage, enable it at least one full window before creating the experiment |
 | Conversion rate says "not enough data" | Missing view coverage for one window, or under 200 views per window | Ensure the embed was on for the whole baseline; otherwise wait for more traffic — other metrics still report |
 | Order backfill truncated | Very high volume store — more than 5000 orders in the sync window | The report is based on partial order data; use a shorter baseline window |
+
+## 7. Briefs, refinements and version history
+
+**Add briefs** (nav) creates variants from a written brief instead of an
+article: one product, one or more languages, any number of briefs. Each brief
+has a name (shown on the dashboard and in the CSV export), the brief text,
+optional references (pasted text and/or one link per line; links are fetched
+with the same guarded fetcher as articles and re-read on every run; a link
+that cannot be read is reported on the version, never fails the run) and
+optional Advanced fields that are folded into the brief. Briefs are queued
+for generation as soon as they are added.
+
+On a brief page's review screen:
+
+- **Refine with a prompt** sends one instruction to the model together with
+  the brief, the references and the current copy (hand edits included); only
+  the sections the instruction concerns change, everything else is kept
+  byte-for-byte. The refinement runs in the background queue like a
+  generation; the live copy is untouched until it succeeds, and a failed
+  refinement shows a "Last refinement failed" banner with the reason. Save
+  any hand edits before refining: the Refine button is disabled while there
+  is unsaved typing.
+- **Edit brief** changes the stored brief for the next refinement or start
+  over; it changes nothing on the page by itself.
+- **Start over** (the brief page's equivalent of Regenerate) rewrites the page
+  from the base copy with the current brief; earlier refinements stay in the
+  history.
+- **Unverified claims** per section: claims the guard found in neither the
+  page copy, the brief, nor the references. Informational.
+
+**Version history** (every variant): each generation, refinement, hand edit
+and restore is a version with a snapshot of all sections; the list shows what
+produced it and which sections changed. *Restore* replaces the live copy with
+that version (storefront within ~2 minutes) and records the restore as a new
+version. Variants generated before this feature get a baseline version the
+first time anything changes them. The last 50 versions are kept per variant.
+
+**Duplicate** (every variant) creates a new variant with a fresh URL carrying
+the same brief, copy, review state and history; the original is untouched.

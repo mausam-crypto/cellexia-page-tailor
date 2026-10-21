@@ -1,13 +1,19 @@
 import { randomInt } from "node:crypto";
 import sanitizeHtml from "sanitize-html";
 import { load as loadHtml } from "cheerio";
+import type {
+  Article as ArticleRow,
+  Override as OverrideRow,
+} from "@prisma/client";
 import prisma from "../db.server";
 import { fetchArticle, fetchPublicHtml } from "./article.server";
 import {
+  adaptFromBrief,
   analyzeAndAdapt,
   claimGuard,
   heuristicFindings,
   normalizeGeneratedPunctuation,
+  refineFromBrief,
 } from "./generate.server";
 import { getSettings, unsafeSelectorReason } from "./settings.server";
 import {
@@ -19,11 +25,23 @@ import {
   type AdminClient,
 } from "./shopify-data.server";
 import {
+  BRIEF_ADVANCED_FIELDS,
   normalizeAdaptationMode,
+  normalizeBriefAdvanced,
+  type BriefAdvanced,
+  type ClaimFindings,
   type CopySurface,
+  type ShopSettingsData,
   type SurfaceContent,
+  type SurfaceSnapshot,
   type VariantPayload,
 } from "./types";
+import {
+  buildVersionCreate,
+  prepareVersion,
+  pruneVersions,
+  snapshotOverrides,
+} from "./versions.server";
 
 // Opaque, keyword-free slug for the public URL. Deliberately meaningless so
 // the parameter carries no query intent to crawlers or competitors.
@@ -82,19 +100,12 @@ export async function createArticlesForProduct(
   },
 ): Promise<string[]> {
   const product = await getProduct(admin, input.productId);
-
-  // The storefront embed reports the handle it sees in the URL path, which
-  // for non-primary locales is the TRANSLATED handle (Translate & Adapt).
-  // Store that same handle, or serving would silently never match.
   const locales = await getShopLocales(admin);
-  const primary = locales.find((l) => l.primary)?.locale ?? "en";
-  const isPrimaryLocale =
-    input.locale.toLowerCase() === primary.toLowerCase();
-  const localeHandle = await getProductHandleForLocale(
+  const localeHandle = await resolveLocaleHandle(
     admin,
     input.productId,
     input.locale,
-    isPrimaryLocale,
+    locales,
   );
 
   const rows: Array<{ sourceUrl?: string; sourceTitle?: string; sourceText?: string }> =
@@ -117,6 +128,7 @@ export async function createArticlesForProduct(
           productHandle: localeHandle,
           productTitle: product.title,
           locale: input.locale,
+          sourceKind: row.sourceUrl ? "article" : "pasted",
           sourceUrl: row.sourceUrl ?? null,
           sourceTitle: row.sourceTitle ?? null,
           sourceText: row.sourceText ?? null,
@@ -126,6 +138,81 @@ export async function createArticlesForProduct(
         },
       }),
     ),
+  );
+  return created.map((a) => a.id);
+}
+
+/**
+ * The storefront embed reports the handle it sees in the URL path, which
+ * for non-primary locales is the TRANSLATED handle (Translate & Adapt).
+ * Store that same handle, or serving would silently never match.
+ */
+async function resolveLocaleHandle(
+  admin: AdminClient,
+  productId: string,
+  locale: string,
+  locales: Awaited<ReturnType<typeof getShopLocales>>,
+): Promise<string> {
+  const primary = locales.find((l) => l.primary)?.locale ?? "en";
+  const isPrimaryLocale = locale.toLowerCase() === primary.toLowerCase();
+  return getProductHandleForLocale(admin, productId, locale, isPrimaryLocale);
+}
+
+/**
+ * Create brief-sourced variants: one Article row per brief x locale, each
+ * with its own variant URL, all "pending" until the queue generates them.
+ * One transaction: a mid-batch failure creates nothing.
+ */
+export async function createBriefsForProduct(
+  admin: AdminClient,
+  shop: string,
+  input: {
+    productId: string;
+    locales: string[];
+    briefs: Array<{
+      name: string;
+      text: string;
+      references?: string;
+      advanced?: BriefAdvanced;
+    }>;
+  },
+): Promise<string[]> {
+  const product = await getProduct(admin, input.productId);
+  const locales = await getShopLocales(admin);
+  const uniqueLocales = [...new Set(input.locales.map((l) => l.trim()).filter(Boolean))];
+  const handles = new Map<string, string>();
+  for (const locale of uniqueLocales) {
+    handles.set(
+      locale,
+      await resolveLocaleHandle(admin, input.productId, locale, locales),
+    );
+  }
+
+  const rows = uniqueLocales.flatMap((locale) =>
+    input.briefs.map((brief) => ({ locale, brief })),
+  );
+  const created = await prisma.$transaction(
+    rows.map(({ locale, brief }) => {
+      const advanced = normalizeBriefAdvanced(brief.advanced ?? {});
+      return prisma.article.create({
+        data: {
+          shop,
+          productId: product.id,
+          productHandle: handles.get(locale)!,
+          productTitle: product.title,
+          locale,
+          sourceKind: "brief",
+          briefName: brief.name.trim(),
+          briefText: brief.text.trim(),
+          briefReferences: brief.references?.trim() || null,
+          briefAdvanced:
+            Object.keys(advanced).length > 0 ? JSON.stringify(advanced) : null,
+          mode: "standard",
+          status: "pending",
+          variantHandle: generateVariantHandle(),
+        },
+      });
+    }),
   );
   return created.map((a) => a.id);
 }
@@ -159,23 +246,18 @@ export async function generateForArticle(
   // untouched while it regenerates. The background queue claims the lock
   // atomically together with dequeueing and passes lockAlreadyHeld.
   if (!options.lockAlreadyHeld) {
-    const lock = await prisma.article.updateMany({
-      where: {
-        id: article.id,
-        shop,
-        OR: [
-          { generatingAt: null },
-          { generatingAt: { lt: new Date(Date.now() - GENERATION_LOCK_STALE_MS) } },
-        ],
-      },
-      data: { generatingAt: new Date() },
-    });
-    if (lock.count === 0) {
-      throw new Error(
-        "A generation is already running for this article. Wait for it to finish.",
-      );
-    }
+    await acquireGenerationLock(article.id, shop);
   }
+
+  // Brief-sourced variants: a pending refinement edits the CURRENT copy;
+  // anything else (first generation, "Start over", a retry) regenerates
+  // from the base copy. Decided up front so a failure is recorded under the
+  // right label.
+  const isBrief = article.sourceKind === "brief";
+  let runKind: "generate" | "refine" =
+    isBrief && (article.pendingRefinement ?? "").trim() !== ""
+      ? "refine"
+      : "generate";
 
   try {
     const settings = await getSettings(shop);
@@ -183,6 +265,35 @@ export async function generateForArticle(
     const primary = locales.find((l) => l.primary)?.locale ?? "en";
     const isPrimaryLocale =
       article.locale.toLowerCase() === primary.toLowerCase();
+
+    if (isBrief) {
+      const existing = await prisma.override.findMany({
+        where: { articleId: article.id },
+        orderBy: { surfaceKey: "asc" },
+      });
+      if (runKind === "refine" && existing.length === 0) {
+        // A refinement queued against copy that has since disappeared:
+        // nothing to refine, so run a plain generation instead.
+        runKind = "generate";
+      }
+      if (runKind === "refine") {
+        await runBriefRefinement(
+          article,
+          existing,
+          (article.pendingRefinement ?? "").trim(),
+        );
+      } else {
+        await runBriefPipeline(
+          admin,
+          article,
+          settings,
+          primary,
+          isPrimaryLocale,
+          existing,
+        );
+      }
+      return;
+    }
 
     let title = article.sourceTitle ?? "";
     let text = article.sourceText ?? "";
@@ -193,30 +304,13 @@ export async function generateForArticle(
     }
     if (!text) throw new Error("Article has no content to analyze.");
 
-    // Admin-sourced surfaces (description, metafields) come from the Admin
-    // API; live-page surfaces are read from the rendered storefront page.
-    const adminSurfaces = settings.surfaces.filter((s) => s.source !== "page");
-    const pageSurfaces = settings.surfaces.filter(
-      (s) => s.source === "page" && s.enabled && s.selector.trim() !== "",
-    );
-
-    const surfaces = await getLocalizedSurfaceContent(
+    const surfaces = await collectBaseSurfaces(
       admin,
-      article.productId,
-      article.locale,
-      adminSurfaces,
+      article,
+      settings,
+      primary,
       isPrimaryLocale,
     );
-    if (pageSurfaces.length > 0) {
-      surfaces.push(
-        ...(await getPageSurfaceContent(admin, article, primary, pageSurfaces)),
-      );
-    }
-    if (surfaces.length === 0) {
-      throw new Error(
-        "No copy surfaces with content found for this product/locale. Check Settings.",
-      );
-    }
 
     const analysis = await analyzeAndAdapt({
       articleTitle: title,
@@ -347,42 +441,63 @@ export async function generateForArticle(
         .join(" "),
     );
 
+    const overrideRows: SurfaceSnapshot[] = pairs.map((pair) => {
+      const surface = surfaces.find((s) => s.surface.key === pair.key)!;
+      const adaptedContent = storedAdapted.get(pair.key)!;
+      const guardFindings = guard.get(pair.key);
+      const heuristics = heuristicFindings(pair.original, adaptedContent, {
+        articleText: text,
+        // Proof-token downgrades are a Meta-mode-only affordance.
+        metaMode: article.mode === "meta",
+      });
+      const warnings = [
+        ...(guardFindings?.warnings ?? []),
+        ...heuristics.warnings,
+      ];
+      const articleClaims = [
+        ...(guardFindings?.articleClaims ?? []),
+        ...heuristics.articleClaims,
+      ];
+      const notes = analysis.adapted.find((a) => a.key === pair.key)?.notes;
+      return {
+        surfaceKey: pair.key,
+        label: surface.surface.label,
+        selector: surface.surface.selector,
+        mode: surface.surface.mode,
+        original: pair.original,
+        adapted: adaptedContent,
+        notes: notes ?? null,
+        warnings: warnings.length ? JSON.stringify(warnings) : null,
+        articleClaims: articleClaims.length
+          ? JSON.stringify(articleClaims)
+          : null,
+        unverifiedClaims: null,
+        enabled: true,
+      };
+    });
+
+    // Version history: the copy this generation replaces becomes the
+    // "before" (a baseline is created lazily for pre-history articles) and
+    // the new copy is recorded as the next version in the same transaction.
+    const previousRows = await prisma.override.findMany({
+      where: { articleId: article.id },
+    });
+    const { number: versionNumber, previousSnapshot } = await prepareVersion(
+      article.id,
+      previousRows,
+    );
+
     await prisma.$transaction([
       prisma.override.deleteMany({ where: { articleId: article.id } }),
-      ...pairs.map((pair) => {
-        const surface = surfaces.find((s) => s.surface.key === pair.key)!;
-        const adaptedContent = storedAdapted.get(pair.key)!;
-        const guardFindings = guard.get(pair.key);
-        const heuristics = heuristicFindings(pair.original, adaptedContent, {
-          articleText: text,
-          // Proof-token downgrades are a Meta-mode-only affordance.
-          metaMode: article.mode === "meta",
-        });
-        const warnings = [
-          ...(guardFindings?.warnings ?? []),
-          ...heuristics.warnings,
-        ];
-        const articleClaims = [
-          ...(guardFindings?.articleClaims ?? []),
-          ...heuristics.articleClaims,
-        ];
-        const notes = analysis.adapted.find((a) => a.key === pair.key)?.notes;
-        return prisma.override.create({
-          data: {
-            articleId: article.id,
-            surfaceKey: pair.key,
-            label: surface.surface.label,
-            selector: surface.surface.selector,
-            mode: surface.surface.mode,
-            original: pair.original,
-            adapted: adaptedContent,
-            notes: notes ?? null,
-            warnings: warnings.length ? JSON.stringify(warnings) : null,
-            articleClaims: articleClaims.length
-              ? JSON.stringify(articleClaims)
-              : null,
-          },
-        });
+      ...overrideRows.map((row) =>
+        prisma.override.create({ data: { articleId: article.id, ...row } }),
+      ),
+      buildVersionCreate({
+        articleId: article.id,
+        number: versionNumber,
+        kind: "generate",
+        snapshot: overrideRows,
+        previousSnapshot,
       }),
       prisma.article.update({
         where: { id: article.id },
@@ -466,21 +581,9 @@ export async function generateForArticle(
         },
       }),
     ]);
+    await pruneVersions(article.id);
   } catch (error) {
-    // A failed regeneration must not take down a live variant. Guard on the
-    // status AT FAILURE TIME, not the row read at entry: generation takes
-    // minutes and the article can be approved while it runs. The two guarded
-    // writes are mutually exclusive on status, so whichever matches applies.
-    const errorMessage =
-      error instanceof Error ? error.message : String(error);
-    await prisma.article.updateMany({
-      where: { id: article.id, status: { not: "approved" } },
-      data: { status: "error", errorMessage, generatingAt: null },
-    });
-    await prisma.article.updateMany({
-      where: { id: article.id, status: "approved" },
-      data: { errorMessage, generatingAt: null },
-    });
+    await recordGenerationFailure(article.id, error, runKind);
     throw error;
   }
 }
@@ -786,4 +889,648 @@ export async function getVariantPayload(
   if (ops.length === 0) return null;
 
   return { v: variantHandle, locale: article.locale, ops };
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline pieces shared by the article and brief paths
+// ---------------------------------------------------------------------------
+
+/** Take the in-flight generation lock, or throw when a live lock is held. */
+async function acquireGenerationLock(
+  articleId: string,
+  shop: string,
+): Promise<void> {
+  const lock = await prisma.article.updateMany({
+    where: {
+      id: articleId,
+      shop,
+      OR: [
+        { generatingAt: null },
+        { generatingAt: { lt: new Date(Date.now() - GENERATION_LOCK_STALE_MS) } },
+      ],
+    },
+    data: { generatingAt: new Date() },
+  });
+  if (lock.count === 0) {
+    throw new Error(
+      "A generation is already running for this article. Wait for it to finish.",
+    );
+  }
+}
+
+/** Prefix on Article.errorMessage when the failed run was a refinement, so
+ *  the review page can title the banner accordingly. */
+export const REFINEMENT_FAILED_PREFIX = "Refinement failed: ";
+
+/**
+ * Record a failed run. A failed regeneration must not take down a live
+ * variant: guard on the status AT FAILURE TIME, not the row read at entry
+ * (generation takes minutes and the article can be approved while it runs).
+ * The two guarded writes are mutually exclusive on status, so whichever
+ * matches applies. A failed refinement never changes status at all: the
+ * live copy was not touched, so the variant keeps whatever state it had.
+ */
+async function recordGenerationFailure(
+  articleId: string,
+  error: unknown,
+  kind: "generate" | "refine",
+): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  if (kind === "refine") {
+    await prisma.article.updateMany({
+      where: { id: articleId },
+      data: {
+        errorMessage: `${REFINEMENT_FAILED_PREFIX}${message}`,
+        generatingAt: null,
+        pendingRefinement: null,
+      },
+    });
+    return;
+  }
+  await prisma.article.updateMany({
+    where: { id: articleId, status: { not: "approved" } },
+    data: {
+      status: "error",
+      errorMessage: message,
+      generatingAt: null,
+      pendingRefinement: null,
+    },
+  });
+  await prisma.article.updateMany({
+    where: { id: articleId, status: "approved" },
+    data: { errorMessage: message, generatingAt: null, pendingRefinement: null },
+  });
+}
+
+/**
+ * Base copy for every enabled surface: admin-sourced surfaces (description,
+ * metafields) from the Admin API, live-page regions from the rendered
+ * storefront page.
+ */
+async function collectBaseSurfaces(
+  admin: AdminClient,
+  article: { productId: string; productHandle: string; locale: string },
+  settings: ShopSettingsData,
+  primary: string,
+  isPrimaryLocale: boolean,
+): Promise<SurfaceContent[]> {
+  const adminSurfaces = settings.surfaces.filter((s) => s.source !== "page");
+  const pageSurfaces = settings.surfaces.filter(
+    (s) => s.source === "page" && s.enabled && s.selector.trim() !== "",
+  );
+
+  const surfaces = await getLocalizedSurfaceContent(
+    admin,
+    article.productId,
+    article.locale,
+    adminSurfaces,
+    isPrimaryLocale,
+  );
+  if (pageSurfaces.length > 0) {
+    surfaces.push(
+      ...(await getPageSurfaceContent(admin, article, primary, pageSurfaces)),
+    );
+  }
+  if (surfaces.length === 0) {
+    throw new Error(
+      "No copy surfaces with content found for this product/locale. Check Settings.",
+    );
+  }
+  return surfaces;
+}
+
+// ---------------------------------------------------------------------------
+// Brief-sourced variants
+// ---------------------------------------------------------------------------
+
+const MAX_REFERENCE_URLS = 10;
+const MAX_REFERENCE_CHARS = 80_000;
+
+/** Split the references box into URL lines and pasted text. A line that is
+ *  exactly one http(s) URL is a link to read; everything else is pasted
+ *  material. */
+export function splitBriefReferences(raw: string | null | undefined): {
+  urls: string[];
+  pasted: string;
+} {
+  const urls: string[] = [];
+  const pastedLines: string[] = [];
+  for (const line of (raw ?? "").split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (/^https?:\/\/\S+$/i.test(trimmed)) urls.push(trimmed);
+    else pastedLines.push(line);
+  }
+  return { urls, pasted: pastedLines.join("\n").trim() };
+}
+
+/** The brief as the model receives it: the free text followed by the
+ *  non-empty advanced fields as labelled lines. */
+export function composeBriefForModel(article: {
+  briefText: string | null;
+  briefAdvanced: string | null;
+}): string {
+  const advanced = normalizeBriefAdvanced(article.briefAdvanced);
+  const extras = BRIEF_ADVANCED_FIELDS.filter(({ key }) => advanced[key]).map(
+    ({ key, label }) => `${label}: ${advanced[key]}`,
+  );
+  const text = (article.briefText ?? "").trim();
+  return [text, ...(extras.length > 0 ? ["", ...extras] : [])].join("\n").trim();
+}
+
+/**
+ * Read the reference material: pasted text as-is, URLs through the guarded
+ * article fetcher. A link that cannot be read never fails the run - it is
+ * reported on the version so the reviewer knows it was skipped.
+ */
+async function resolveBriefReferences(
+  raw: string | null,
+): Promise<{ referencesText: string; runWarnings: string[] }> {
+  const { urls, pasted } = splitBriefReferences(raw);
+  const runWarnings: string[] = [];
+  const blocks: string[] = [];
+  if (pasted) blocks.push(`<reference source="pasted">\n${pasted}\n</reference>`);
+  if (urls.length > MAX_REFERENCE_URLS) {
+    runWarnings.push(
+      `Only the first ${MAX_REFERENCE_URLS} reference links were read (${urls.length} given).`,
+    );
+  }
+  for (const url of urls.slice(0, MAX_REFERENCE_URLS)) {
+    try {
+      const extracted = await fetchArticle(url);
+      blocks.push(
+        `<reference source="${url.replace(/"/g, "%22")}" title="${extracted.title.replace(/"/g, "'")}">\n${extracted.text}\n</reference>`,
+      );
+    } catch (error) {
+      runWarnings.push(
+        `Could not read reference ${url}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+  let referencesText = blocks.join("\n\n");
+  if (referencesText.length > MAX_REFERENCE_CHARS) {
+    referencesText = referencesText.slice(0, MAX_REFERENCE_CHARS);
+    runWarnings.push(
+      `The reference material was cut at ${MAX_REFERENCE_CHARS.toLocaleString("en-US")} characters.`,
+    );
+  }
+  return { referencesText, runWarnings };
+}
+
+function findingsJson(list: string[] | undefined): string | null {
+  return list && list.length > 0 ? JSON.stringify([...new Set(list)]) : null;
+}
+
+/**
+ * Brief-sourced generation: base copy -> one adaptation pass to the brief ->
+ * structural backstops -> claim guard against the brief and references ->
+ * live, with the result recorded as a new version. Mirrors the article
+ * pipeline's safety rails; the structural checks run unconditionally
+ * because a brief may ask for removals.
+ */
+async function runBriefPipeline(
+  admin: AdminClient,
+  article: ArticleRow,
+  settings: ShopSettingsData,
+  primary: string,
+  isPrimaryLocale: boolean,
+  existing: OverrideRow[],
+): Promise<void> {
+  const brief = composeBriefForModel(article);
+  if (!brief) {
+    throw new Error("This brief is empty. Edit the brief, then start over.");
+  }
+  const surfaces = await collectBaseSurfaces(
+    admin,
+    article,
+    settings,
+    primary,
+    isPrimaryLocale,
+  );
+  const { referencesText, runWarnings } = await resolveBriefReferences(
+    article.briefReferences,
+  );
+
+  const result = await adaptFromBrief({
+    productTitle: article.productTitle,
+    locale: article.locale,
+    briefName: article.briefName ?? "",
+    brief,
+    referencesText,
+    surfaces,
+  });
+
+  const missing = surfaces.filter(
+    (s) => !result.adapted.some((a) => a.key === s.surface.key),
+  );
+  if (missing.length > 0) {
+    throw new Error(
+      `Generation did not return these surfaces: ${missing
+        .map((m) => m.surface.key)
+        .join(", ")}. Retry the generation.`,
+    );
+  }
+  const pairs = result.adapted
+    .map((a) => {
+      const base = surfaces.find((s) => s.surface.key === a.key);
+      return base
+        ? { key: a.key, original: base.content, adapted: a.adapted }
+        : null;
+    })
+    .filter((p): p is NonNullable<typeof p> => p !== null);
+  if (pairs.length === 0) {
+    throw new Error("Generation produced no usable surfaces. Retry.");
+  }
+
+  for (const pair of pairs) {
+    const surface = surfaces.find((s) => s.surface.key === pair.key);
+    if (surface?.surface.mode !== "html") continue;
+    const empty = emptySectionProblem(pair.adapted);
+    if (empty) {
+      throw new Error(
+        `The adaptation left ${empty} in "${surface.surface.label}". Retry the generation.`,
+      );
+    }
+    const accordion = accordionMarkupProblem(pair.original, pair.adapted);
+    if (accordion) {
+      throw new Error(
+        `The adaptation produced ${accordion} in "${surface.surface.label}". Retry the generation.`,
+      );
+    }
+  }
+
+  const sourceText = [brief, referencesText].filter(Boolean).join("\n\n");
+  const guard = await claimGuard(pairs, sourceText, "standard", {
+    source: "brief",
+  });
+  const guardMissing = pairs.filter((p) => !guard.has(p.key));
+  if (guardMissing.length > 0) {
+    throw new Error(
+      `The claim guard did not return these surfaces: ${guardMissing
+        .map((p) => p.key)
+        .join(", ")}. Retry the generation.`,
+    );
+  }
+
+  const overrideRows: SurfaceSnapshot[] = pairs.map((pair) => {
+    const surface = surfaces.find((s) => s.surface.key === pair.key)!;
+    const dashFree = normalizeGeneratedPunctuation(pair.adapted);
+    const adaptedContent =
+      surface.surface.mode === "html" ? sanitizeAdaptedHtml(dashFree) : dashFree;
+    const visibleText =
+      surface.surface.mode === "html"
+        ? adaptedContent.replace(/<[^>]*>/g, "").trim()
+        : adaptedContent.trim();
+    if (visibleText === "") {
+      throw new Error(
+        `The adaptation left "${surface.surface.label}" empty. Retry the generation.`,
+      );
+    }
+    const guardFindings = guard.get(pair.key);
+    const heuristics = heuristicFindings(pair.original, adaptedContent, {
+      metaMode: false,
+    });
+    const notes = result.adapted.find((a) => a.key === pair.key)?.notes;
+    return {
+      surfaceKey: pair.key,
+      label: surface.surface.label,
+      selector: surface.surface.selector,
+      mode: surface.surface.mode,
+      original: pair.original,
+      adapted: adaptedContent,
+      notes: notes?.trim() ? normalizeGeneratedPunctuation(notes) : null,
+      warnings: findingsJson(heuristics.warnings),
+      articleClaims: findingsJson([
+        ...(guardFindings?.articleClaims ?? []),
+        ...heuristics.articleClaims,
+      ]),
+      unverifiedClaims: findingsJson(guardFindings?.warnings),
+      enabled: true,
+    };
+  });
+
+  const { number, previousSnapshot } = await prepareVersion(article.id, existing);
+  await prisma.$transaction([
+    prisma.override.deleteMany({ where: { articleId: article.id } }),
+    ...overrideRows.map((row) =>
+      prisma.override.create({ data: { articleId: article.id, ...row } }),
+    ),
+    buildVersionCreate({
+      articleId: article.id,
+      number,
+      kind: "generate",
+      snapshot: overrideRows,
+      previousSnapshot,
+      modelNotes: result.summary || null,
+      runWarnings,
+    }),
+    prisma.article.update({
+      where: { id: article.id },
+      data: {
+        generatedMode: "standard",
+        // Post-publication review model, same as articles: live at once,
+        // reviewedAt reset so the merchant is notified to read the copy.
+        status: "approved",
+        wasApproved: true,
+        reviewedAt: null,
+        errorMessage: null,
+        generatingAt: null,
+        pendingRefinement: null,
+      },
+    }),
+  ]);
+  await pruneVersions(article.id);
+}
+
+/**
+ * Refinement of a brief-sourced variant: apply one instruction to the
+ * CURRENT copy (hand edits included). Untouched surfaces keep their stored
+ * copy and findings byte-for-byte; changed surfaces go through the same
+ * sanitizing, structural and claim checks as a generation. Any failure
+ * leaves the live copy exactly as it was.
+ */
+async function runBriefRefinement(
+  article: ArticleRow,
+  existing: OverrideRow[],
+  instruction: string,
+): Promise<void> {
+  const brief = composeBriefForModel(article);
+  const { referencesText, runWarnings } = await resolveBriefReferences(
+    article.briefReferences,
+  );
+
+  // Earlier instructions still in force: every refinement since the last
+  // full generation or restore (either of those starts a fresh chain).
+  const versions = await prisma.variantVersion.findMany({
+    where: { articleId: article.id },
+    orderBy: { number: "asc" },
+    select: { number: true, kind: true, instruction: true },
+  });
+  const chainStart =
+    [...versions]
+      .reverse()
+      .find((v) => v.kind === "generate" || v.kind === "restore")?.number ?? 0;
+  const previousInstructions = versions
+    .filter((v) => v.number > chainStart && v.kind === "refine" && v.instruction)
+    .map((v) => v.instruction as string);
+
+  const result = await refineFromBrief({
+    productTitle: article.productTitle,
+    locale: article.locale,
+    briefName: article.briefName ?? "",
+    brief,
+    referencesText,
+    surfaces: existing.map((o) => ({
+      key: o.surfaceKey,
+      label: o.label,
+      mode: o.mode,
+      original: o.original,
+      current: o.adapted,
+    })),
+    previousInstructions,
+    instruction,
+  });
+
+  const byKey = new Map(result.surfaces.map((r) => [r.key, r]));
+  const missing = existing.filter((o) => !byKey.has(o.surfaceKey));
+  if (missing.length > 0) {
+    throw new Error(
+      `The refinement did not return these surfaces: ${missing
+        .map((m) => m.surfaceKey)
+        .join(", ")}. Retry.`,
+    );
+  }
+
+  // First pass: decide what actually changed and validate it.
+  const changes = new Map<
+    string,
+    { rawAdapted: string; adaptedContent: string; notes: string | null }
+  >();
+  for (const o of existing) {
+    const r = byKey.get(o.surfaceKey)!;
+    if (r.unchanged || r.adapted.trim() === "" || r.adapted === o.adapted) {
+      continue;
+    }
+    const dashFree = normalizeGeneratedPunctuation(r.adapted);
+    const adaptedContent =
+      o.mode === "html" ? sanitizeAdaptedHtml(dashFree) : dashFree;
+    if (adaptedContent === o.adapted) continue;
+    const visibleText =
+      o.mode === "html"
+        ? adaptedContent.replace(/<[^>]*>/g, "").trim()
+        : adaptedContent.trim();
+    if (visibleText === "") {
+      throw new Error(
+        `The refinement left "${o.label}" empty. Untick "Include this surface" instead, or rephrase the instruction.`,
+      );
+    }
+    if (o.mode === "html") {
+      const empty = emptySectionProblem(adaptedContent);
+      if (empty) {
+        throw new Error(
+          `The refinement left ${empty} in "${o.label}". Rephrase the instruction and retry.`,
+        );
+      }
+      const accordion = accordionMarkupProblem(o.original, adaptedContent);
+      if (accordion) {
+        throw new Error(
+          `The refinement produced ${accordion} in "${o.label}". Rephrase the instruction and retry.`,
+        );
+      }
+    }
+    changes.set(o.surfaceKey, {
+      rawAdapted: r.adapted,
+      adaptedContent,
+      notes: r.notes?.trim() ? normalizeGeneratedPunctuation(r.notes) : null,
+    });
+  }
+
+  // Claim guard on the changed surfaces only; untouched ones keep their
+  // stored findings.
+  let guard = new Map<string, ClaimFindings>();
+  if (changes.size > 0) {
+    const changedPairs = existing
+      .filter((o) => changes.has(o.surfaceKey))
+      .map((o) => ({
+        key: o.surfaceKey,
+        original: o.original,
+        adapted: changes.get(o.surfaceKey)!.rawAdapted,
+      }));
+    const sourceText = [brief, referencesText].filter(Boolean).join("\n\n");
+    guard = await claimGuard(changedPairs, sourceText, "standard", {
+      source: "brief",
+    });
+    const guardMissing = changedPairs.filter((p) => !guard.has(p.key));
+    if (guardMissing.length > 0) {
+      throw new Error(
+        `The claim guard did not return these surfaces: ${guardMissing
+          .map((p) => p.key)
+          .join(", ")}. Retry.`,
+      );
+    }
+  }
+
+  const nextRows: SurfaceSnapshot[] = existing.map((o) => {
+    const base: SurfaceSnapshot = {
+      surfaceKey: o.surfaceKey,
+      label: o.label,
+      selector: o.selector,
+      mode: o.mode,
+      original: o.original,
+      adapted: o.adapted,
+      notes: o.notes,
+      warnings: o.warnings,
+      articleClaims: o.articleClaims,
+      unverifiedClaims: o.unverifiedClaims,
+      enabled: o.enabled,
+    };
+    const change = changes.get(o.surfaceKey);
+    if (!change) return base;
+    const heuristics = heuristicFindings(o.original, change.adaptedContent, {
+      metaMode: false,
+    });
+    const g = guard.get(o.surfaceKey);
+    return {
+      ...base,
+      adapted: change.adaptedContent,
+      notes: change.notes ?? o.notes,
+      warnings: findingsJson(heuristics.warnings),
+      articleClaims: findingsJson([
+        ...(g?.articleClaims ?? []),
+        ...heuristics.articleClaims,
+      ]),
+      unverifiedClaims: findingsJson(g?.warnings),
+    };
+  });
+
+  const { number, previousSnapshot } = await prepareVersion(article.id, existing);
+  await prisma.$transaction([
+    // Fresh ids on purpose: the review page's stale-copy guard keys on them.
+    prisma.override.deleteMany({ where: { articleId: article.id } }),
+    ...nextRows.map((row) =>
+      prisma.override.create({ data: { articleId: article.id, ...row } }),
+    ),
+    buildVersionCreate({
+      articleId: article.id,
+      number,
+      kind: "refine",
+      instruction,
+      snapshot: nextRows,
+      previousSnapshot,
+      modelNotes: result.summary || null,
+      runWarnings,
+    }),
+    prisma.article.update({
+      where: { id: article.id },
+      data: {
+        // New model-written copy is live and unread: notify for review.
+        // A refinement that changed nothing leaves the review stamp alone.
+        ...(changes.size > 0 ? { reviewedAt: null } : {}),
+        errorMessage: null,
+        generatingAt: null,
+        pendingRefinement: null,
+      },
+    }),
+  ]);
+  await pruneVersions(article.id);
+}
+
+/**
+ * Copy a variant (any source kind) to a new one with its own URL: the brief,
+ * the current copy, the review state and the whole version history travel
+ * with it, plus a "duplicate" marker version. The original is untouched.
+ */
+export async function duplicateArticle(
+  shop: string,
+  articleId: string,
+): Promise<string> {
+  const source = await prisma.article.findFirst({
+    where: { id: articleId, shop },
+    include: { overrides: true, versions: { orderBy: { number: "asc" } } },
+  });
+  if (!source) throw new Error("Article not found");
+  if (isQueuedFresh(source) || isGenerationInFlight(source)) {
+    throw new Error(
+      "A generation is queued or running for this variant. Wait for it to finish before duplicating.",
+    );
+  }
+  const snapshot = snapshotOverrides(source.overrides);
+  const label = source.briefName ?? source.sourceTitle ?? source.variantHandle;
+  const lastNumber = source.versions.at(-1)?.number ?? 0;
+  // A copy with no copy to serve starts "pending"; a failed source with
+  // stored copy starts offline rather than carrying the failure over.
+  const status =
+    snapshot.length === 0
+      ? "pending"
+      : source.status === "error"
+        ? "generated"
+        : source.status;
+
+  const created = await prisma.$transaction(async (tx) => {
+    const copy = await tx.article.create({
+      data: {
+        shop,
+        productId: source.productId,
+        productHandle: source.productHandle,
+        productTitle: source.productTitle,
+        locale: source.locale,
+        sourceKind: source.sourceKind,
+        sourceUrl: source.sourceUrl,
+        sourceTitle: source.sourceTitle,
+        sourceText: source.sourceText,
+        briefName: source.briefName ? `${source.briefName} (copy)` : null,
+        briefText: source.briefText,
+        briefReferences: source.briefReferences,
+        briefAdvanced: source.briefAdvanced,
+        detectedQuery: source.detectedQuery,
+        queryVariants: source.queryVariants,
+        evidence: source.evidence,
+        proofPoints: source.proofPoints,
+        personaPriorities: source.personaPriorities,
+        conversionPlan: source.conversionPlan,
+        v2Plan: source.v2Plan,
+        subtlePlan: source.subtlePlan,
+        mode: source.mode,
+        generatedMode: source.generatedMode,
+        status,
+        wasApproved: status === "approved" ? true : source.wasApproved,
+        reviewedAt: snapshot.length > 0 ? source.reviewedAt : null,
+        variantHandle: generateVariantHandle(),
+      },
+    });
+    if (snapshot.length > 0) {
+      await tx.override.createMany({
+        data: snapshot.map((s) => ({ articleId: copy.id, ...s })),
+      });
+    }
+    if (source.versions.length > 0) {
+      await tx.variantVersion.createMany({
+        data: source.versions.map((v) => ({
+          articleId: copy.id,
+          number: v.number,
+          kind: v.kind,
+          instruction: v.instruction,
+          surfaces: v.surfaces,
+          modelNotes: v.modelNotes,
+          runWarnings: v.runWarnings,
+          changedSurfaces: v.changedSurfaces,
+          restoredFrom: v.restoredFrom,
+          createdAt: v.createdAt,
+        })),
+      });
+    }
+    await tx.variantVersion.create({
+      data: {
+        articleId: copy.id,
+        number: lastNumber + 1,
+        kind: "duplicate",
+        instruction: `Duplicated from ${label}`,
+        surfaces: JSON.stringify(snapshot),
+        changedSurfaces: "[]",
+      },
+    });
+    return copy;
+  });
+  return created.id;
 }

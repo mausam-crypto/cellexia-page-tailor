@@ -100,6 +100,24 @@ model Article {
   sourceUrl     String?
   sourceTitle   String?
   sourceText    String? // extracted article body used for analysis
+  // How the source was supplied: "article" (fetched from sourceUrl),
+  // "pasted" (article text pasted by hand), or "brief" (a merchant-written
+  // campaign brief; there is no article at all).
+  sourceKind    String     @default("article") // article | pasted | brief
+  // Brief-sourced variants only: the brief as typed, an optional reference
+  // box (pasted text and/or one URL per line; re-read on every run), and
+  // the optional structured "advanced" fields as JSON
+  // ({ audience?, keyMessage?, tone?, mustSay?, mustAvoid? }).
+  briefName       String?
+  briefText       String?
+  briefReferences String?
+  briefAdvanced   String?
+  // A refinement instruction waiting for the background queue. When set,
+  // the next run edits the CURRENT copy per this instruction instead of
+  // regenerating from the base copy. Every enqueue writes this column
+  // explicitly (instruction or null), so a value left behind by a crashed
+  // run can never be mis-applied by a later plain generation.
+  pendingRefinement String?
   detectedQuery String?
   queryVariants String? // JSON string[]
   evidence      String? // JSON string[] of article phrases supporting the query inference
@@ -143,6 +161,7 @@ model Article {
   subtlePlan        String? // JSON SubtlePlan: subtle-intent concern + term decision + insertions
   variantHandle String     @unique // opaque slug used in the public URL
   overrides     Override[]
+  versions      VariantVersion[]
   createdAt     DateTime   @default(now())
   updatedAt     DateTime   @updatedAt
 
@@ -162,11 +181,40 @@ model Override {
   original   String
   adapted    String
   notes         String?
-  warnings      String? // JSON string[]: unsupported claims + risky patterns; block approval until attested
-  articleClaims String? // JSON string[]: new claims grounded in the source article; shown for review, covered by the same attestation
+  warnings      String? // JSON string[]: unsupported claims + risky patterns; shown as "Flagged for review" (post-publication model: nothing blocks)
+  articleClaims String? // JSON string[]: new claims grounded in the source article (or, for briefs, in the brief/references); shown for review
+  // Brief-sourced variants only: claims the guard found in none of the page
+  // copy, the brief, or the references. Informational ("unverified, check
+  // before launch"); never blocks. Untouched by hand edits until the next
+  // generation or refinement replaces the row.
+  unverifiedClaims String? // JSON string[]
   enabled       Boolean @default(true)
 
   @@unique([articleId, surfaceKey])
+}
+
+// Append-only history of a variant's copy. One row per event that changed
+// the live Override rows (generation, refinement, hand edit, restore,
+// duplicate), holding a full snapshot of every surface right AFTER the
+// event. Override stays the live copy that serving reads; restoring a
+// version copies its snapshot back into fresh Override rows.
+model VariantVersion {
+  id              String   @id @default(cuid())
+  articleId       String
+  article         Article  @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  number          Int // 1-based, per article
+  kind            String // generate | refine | edit | restore | duplicate
+  // refine: the merchant's instruction; edit: "Edited: <labels>";
+  // duplicate: "Duplicated from <name>"; generate/restore: null.
+  instruction     String?
+  surfaces        String // JSON SurfaceSnapshot[]: the live state right after this event
+  modelNotes      String? // generate/refine: the model's summary of what it changed
+  runWarnings     String? // JSON string[]: e.g. reference URLs that could not be read
+  changedSurfaces String? // JSON string[] of surface labels that differ from the previous version
+  restoredFrom    Int? // restore: the version number that was restored
+  createdAt       DateTime @default(now())
+
+  @@unique([articleId, number])
 }
 
 model Session {

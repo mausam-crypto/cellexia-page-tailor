@@ -67,15 +67,22 @@ function ensureWorker(): void {
  * racing enqueues (double-clicks, two tabs) can never double-queue. Articles
  * already queued, currently generating, or currently occupying a worker slot
  * are skipped.
+ *
+ * `refinement` (brief-sourced variants only) queues a refinement of the
+ * CURRENT copy instead of a regeneration. The column is written explicitly
+ * on EVERY enqueue (instruction or null) so a value left behind by a crashed
+ * run can never be mis-applied by a later plain generation.
  */
 export async function enqueueGeneration(
   shop: string,
   articleIds: string[],
+  options: { refinement?: string } = {},
 ): Promise<{ queued: number; skipped: number }> {
   ensureWorker();
   const s = state();
   let queued = 0;
   let skipped = 0;
+  const pendingRefinement = options.refinement?.trim() || null;
   for (const id of articleIds) {
     if (s.inFlight.has(id)) {
       skipped++;
@@ -91,7 +98,7 @@ export async function enqueueGeneration(
           { generatingAt: { lt: lockStaleCutoff() } },
         ],
       },
-      data: { queuedAt: new Date(), errorMessage: null },
+      data: { queuedAt: new Date(), errorMessage: null, pendingRefinement },
     });
     if (result.count === 1) queued++;
     else skipped++;
@@ -193,13 +200,13 @@ async function runOne(articleId: string, shop: string): Promise<void> {
     await prisma.article
       .updateMany({
         where: { id: articleId, status: { not: "approved" } },
-        data: { status: "error", errorMessage: message },
+        data: { status: "error", errorMessage: message, pendingRefinement: null },
       })
       .catch(() => {});
     await prisma.article
       .updateMany({
         where: { id: articleId, status: "approved" },
-        data: { errorMessage: message },
+        data: { errorMessage: message, pendingRefinement: null },
       })
       .catch(() => {});
   }

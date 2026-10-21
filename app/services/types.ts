@@ -272,11 +272,94 @@ export interface ArticleAnalysis {
 /** Outcome of the claim/heuristic review for one surface. */
 export interface ClaimFindings {
   /** Claims supported by neither the original copy nor the article, plus
-   *  risky patterns — block approval until the reviewer attests. */
+   *  risky patterns — shown as "Flagged for review" (post-publication
+   *  model: nothing blocks). For brief-sourced variants the model guard's
+   *  unsupported claims are stored separately as unverifiedClaims. */
   warnings: string[];
-  /** New claims the original copy doesn't make but the article supports —
-   *  shown for review and covered by the same attestation. */
+  /** New claims the original copy doesn't make but the article (or, for
+   *  briefs, the brief/references) supports — shown for review. */
   articleClaims: string[];
+}
+
+/** How a variant's source was supplied. "brief" variants have no article:
+ *  the merchant's campaign brief drives the copy. */
+export type SourceKind = "article" | "pasted" | "brief";
+
+export function normalizeSourceKind(value: string | null | undefined): SourceKind {
+  return value === "brief" || value === "pasted" ? value : "article";
+}
+
+/** Optional structured fields of a brief ("Advanced" section). Every field
+ *  is folded into the brief text the model receives. */
+export interface BriefAdvanced {
+  audience?: string;
+  keyMessage?: string;
+  tone?: string;
+  mustSay?: string;
+  mustAvoid?: string;
+}
+
+export const BRIEF_ADVANCED_FIELDS: Array<{
+  key: keyof BriefAdvanced;
+  label: string;
+}> = [
+  { key: "audience", label: "Audience" },
+  { key: "keyMessage", label: "Key message" },
+  { key: "tone", label: "Tone" },
+  { key: "mustSay", label: "Must say" },
+  { key: "mustAvoid", label: "Must avoid" },
+];
+
+/** Parse a stored/submitted advanced-fields value; anything malformed is
+ *  dropped field by field, and empty strings are omitted. */
+export function normalizeBriefAdvanced(raw: unknown): BriefAdvanced {
+  let value: unknown = raw;
+  if (typeof raw === "string") {
+    try {
+      value = JSON.parse(raw);
+    } catch {
+      value = {};
+    }
+  }
+  const r = (typeof value === "object" && value !== null ? value : {}) as Record<
+    string,
+    unknown
+  >;
+  const out: BriefAdvanced = {};
+  for (const { key } of BRIEF_ADVANCED_FIELDS) {
+    const v = r[key];
+    if (typeof v === "string" && v.trim() !== "") out[key] = v.trim();
+  }
+  return out;
+}
+
+/** What produced a VariantVersion row. */
+export type VersionKind = "generate" | "refine" | "edit" | "restore" | "duplicate";
+
+export function normalizeVersionKind(value: string): VersionKind {
+  return value === "refine" ||
+    value === "edit" ||
+    value === "restore" ||
+    value === "duplicate"
+    ? value
+    : "generate";
+}
+
+/** One surface as stored in a VariantVersion snapshot: an Override row
+ *  minus its ids, JSON columns kept as the raw strings so a restore is a
+ *  straight copy. */
+export interface SurfaceSnapshot {
+  surfaceKey: string;
+  label: string;
+  selector: string;
+  mode: string;
+  original: string;
+  adapted: string;
+  notes: string | null;
+  warnings: string | null;
+  articleClaims: string | null;
+  unverifiedClaims: string | null;
+  enabled: boolean;
 }
 
 export interface GuardWarning {

@@ -1,32 +1,73 @@
-# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+# This file stores configurations for your Shopify app.
+# Run `shopify app config link` once to attach it to an app in your Partner org.
 
 client_id = "24912e424a44ae220c00e7e2a070273f"
 name = "Cellexia-page-tailor"
-application_url = "https://cellexia-page-tailor.onrender.com"
+
+# The admin UI is an embedded app. IMPORTANT: if application_url is missing
+# (or a dead placeholder) when `shopify app deploy` pushes this config,
+# Shopify registers the app WITHOUT an app home and the Admin shows
+# "Find this app in the pages where you work" instead of the app.
+#
+# - Development: `npm run dev` sets application_url and the auth redirect to
+#   the CLI tunnel automatically; the UI only loads while dev is running.
+# - Production: host the server first, then set application_url and
+#   [auth].redirect_urls below to the real host BEFORE `npm run deploy`.
 embedded = true
+application_url = "https://cellexia-page-tailor.onrender.com"
 
 [build]
 automatically_update_urls_on_dev = true
 
-[webhooks]
-api_version = "2026-10"
-
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/app/scopes_update"
-  topics = [ "app/scopes_update" ]
-
-  [[webhooks.subscriptions]]
-  uri = "/webhooks/app/uninstalled"
-  topics = [ "app/uninstalled" ]
+[auth]
+redirect_urls = ["https://cellexia-page-tailor.onrender.com/auth/callback"]
 
 [access_scopes]
-# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+# read_products      -> product copy + metafields (Accentuate fields are plain metafields)
+# read_translations  -> localized copy managed by Translate & Adapt
+# read_locales       -> published shop locales and URL prefixes
+# read_orders        -> experiment metrics (orders/AOV/revenue for baseline vs treatment)
+# The app never writes to products: variants live in the app database only.
 scopes = "read_products,read_translations,read_locales,read_orders"
 
-[auth]
-redirect_urls = [ "https://cellexia-page-tailor.onrender.com/auth/callback" ]
-
+# Storefront requests to /apps/cx/* are proxied to this app at /proxy/*.
+# The Shopify CLI rewrites `url` automatically during `shopify app dev`.
 [app_proxy]
 url = "https://cellexia-page-tailor.onrender.com/proxy"
 subpath = "cx"
 prefix = "apps"
+
+[webhooks]
+api_version = "2026-10"
+
+  # Handled by: /app/routes/webhooks.app.uninstalled.tsx
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = ["app/uninstalled"]
+
+  # Handled by: /app/routes/webhooks.app.scopes_update.tsx
+  [[webhooks.subscriptions]]
+  topics = [ "app/scopes_update" ]
+  uri = "/webhooks/app/scopes_update"
+
+  # Webhooks can have filters
+  # Only receive webhooks for product updates with a product price >= 10.00
+  # See: https://shopify.dev/docs/apps/build/webhooks/customize/filters
+  # [[webhooks.subscriptions]]
+  # topics = ["products/update"]
+  # uri = "/webhooks/products/update"
+  # filter = "variants.price:>=10.00"
+
+  # Mandatory compliance topic for public apps only
+  # See: https://shopify.dev/docs/apps/build/privacy-law-compliance
+  # [[webhooks.subscriptions]]
+  # uri = "/webhooks/customers/data_request"
+  # compliance_topics = ["customers/data_request"]
+
+  # [[webhooks.subscriptions]]
+  # uri = "/webhooks/customers/redact"
+  # compliance_topics = ["customers/redact"]
+
+  # [[webhooks.subscriptions]]
+  # uri = "/webhooks/shop/redact"
+  # compliance_topics = ["shop/redact"]

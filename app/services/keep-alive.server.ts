@@ -19,8 +19,7 @@ const store = globalThis as typeof globalThis & {
 
 export function startKeepAlive(): void {
   if (store.__pageTailorKeepAlive) return;
-  const appUrl =
-    process.env.SHOPIFY_APP_URL || process.env.RENDER_EXTERNAL_URL || "";
+  const appUrl = process.env.SHOPIFY_APP_URL ?? "";
   if (
     process.env.NODE_ENV !== "production" ||
     process.env.PAGE_TAILOR_KEEP_ALIVE === "off" ||

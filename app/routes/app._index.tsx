@@ -62,7 +62,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
         where: { shop },
         orderBy: { createdAt: "desc" },
         include: {
-          overrides: { select: { warnings: true, articleClaims: true } },
+          overrides: {
+            select: { warnings: true, articleClaims: true, unverifiedClaims: true },
+          },
         },
       }),
       getSettings(shop),
@@ -152,6 +154,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       productTitle: article.productTitle,
       locale: article.locale,
       localeName: localeNames.get(article.locale) ?? article.locale,
+      sourceKind: article.sourceKind,
+      briefName: article.briefName,
       sourceTitle: article.sourceTitle,
       sourceUrl: article.sourceUrl,
       detectedQuery: article.detectedQuery,
@@ -163,7 +167,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       generating: isGenerationInFlight(article),
       errorMessage: article.errorMessage,
       overrideCount: article.overrides.length,
-      hasWarnings: article.overrides.some((o) => o.warnings || o.articleClaims),
+      hasWarnings: article.overrides.some(
+        (o) => o.warnings || o.articleClaims || o.unverifiedClaims,
+      ),
       // Every article has its unique URL from the moment it is created; the
       // export lists them all and marks which are currently live. The UI's
       // Copy URL button still only shows for live rows.
@@ -299,6 +305,8 @@ type ArticleRow = {
   productTitle: string;
   locale: string;
   localeName: string;
+  sourceKind: string;
+  briefName: string | null;
   sourceTitle: string | null;
   sourceUrl: string | null;
   detectedQuery: string | null;
@@ -329,6 +337,18 @@ function statusTextFor(article: ArticleRow): string {
   }
 }
 
+/** The dashboard's "Article" column text for a row: the brief's name, the
+ *  article's title, its URL, or "Pasted". */
+function sourceLabelFor(article: {
+  sourceKind: string;
+  briefName: string | null;
+  sourceTitle: string | null;
+  sourceUrl: string | null;
+}): string {
+  if (article.sourceKind === "brief") return article.briefName ?? "Brief";
+  return article.sourceTitle ?? article.sourceUrl ?? "Pasted";
+}
+
 function csvEscape(value: string | null | undefined): string {
   const raw = value ?? "";
   // Neutralize spreadsheet formula injection (CWE-1236): titles and queries
@@ -342,6 +362,7 @@ function buildLinksCsv(rows: ArticleRow[], servingEnabled: boolean): string {
   const header = [
     "Product",
     "Language",
+    "Source",
     "Article",
     "Original article URL",
     "Variant page URL",
@@ -355,7 +376,14 @@ function buildLinksCsv(rows: ArticleRow[], servingEnabled: boolean): string {
     [
       a.productTitle,
       a.localeName,
-      a.sourceTitle ?? (a.sourceUrl ? "" : "Pasted article"),
+      a.sourceKind === "brief"
+        ? "Brief"
+        : a.sourceKind === "pasted" || !a.sourceUrl
+          ? "Pasted article"
+          : "Article",
+      a.sourceKind === "brief"
+        ? (a.briefName ?? "")
+        : (a.sourceTitle ?? (a.sourceUrl ? "" : "Pasted article")),
       a.sourceUrl ?? "",
       a.variantUrl ?? "",
       a.status === "approved"
@@ -453,6 +481,7 @@ export default function Index() {
   const [productFilter, setProductFilter] = useState("all");
   const [localeFilter, setLocaleFilter] = useState("all");
   const [modeFilter, setModeFilter] = useState("all");
+  const [sourceFilter, setSourceFilter] = useState("all");
   const revalidator = useRevalidator();
 
   const queuedCount = articles.filter((a) => a.queued).length;
@@ -524,6 +553,11 @@ export default function Index() {
       ([value, label]) => ({ label: `${label} (${value})`, value }),
     ),
   ];
+  const sourceOptions = [
+    { label: "All sources", value: "all" },
+    { label: "Articles only", value: "article" },
+    { label: "Briefs only", value: "brief" },
+  ];
   const modeOptions = [
     { label: "All modes", value: "all" },
     { label: "Standard only", value: "standard" },
@@ -535,16 +569,20 @@ export default function Index() {
     { label: "Ultra Custom V2 only", value: "v2" },
   ];
 
-  // All filters stack: status tab, product, language, meta mode, and search.
+  // All filters stack: status tab, product, language, source, mode, and
+  // search. "Articles" covers fetched and pasted articles alike.
   const query = searchQuery.trim().toLowerCase();
   const visibleArticles = articles.filter((article) => {
     if (!STATUS_TABS[selectedTab].match(article)) return false;
     if (productFilter !== "all" && article.productId !== productFilter) return false;
     if (localeFilter !== "all" && article.locale !== localeFilter) return false;
+    if (sourceFilter === "brief" && article.sourceKind !== "brief") return false;
+    if (sourceFilter === "article" && article.sourceKind === "brief") return false;
     if (modeFilter !== "all" && article.mode !== modeFilter) return false;
     if (!query) return true;
     return [
       article.productTitle,
+      article.briefName ?? "",
       article.sourceTitle ?? "",
       article.sourceUrl ?? "",
       article.detectedQuery ?? "",
@@ -601,9 +639,11 @@ export default function Index() {
       >
         <p>
           Add article URLs for a product and language and generate an adapted
-          version of the product page copy for each article. Variants go live
-          automatically and you are notified to review them; copy each variant
-          URL into its article. Your Shopify product is never modified.
+          version of the product page copy for each article — or write a brief
+          describing a campaign angle and get a page tailored to it. Variants
+          go live automatically and you are notified to review them; copy each
+          variant URL into its article or ad. Your Shopify product is never
+          modified.
         </p>
       </EmptyState>
     </Card>
@@ -623,9 +663,14 @@ export default function Index() {
       </IndexTable.Cell>
       <IndexTable.Cell>{article.localeName}</IndexTable.Cell>
       <IndexTable.Cell>
-        <Text as="span" variant="bodyMd" truncate>
-          {article.sourceTitle ?? article.sourceUrl ?? "Pasted"}
-        </Text>
+        <InlineStack gap="100" blockAlign="center" wrap={false}>
+          {article.sourceKind === "brief" ? (
+            <Badge tone="info">Brief</Badge>
+          ) : null}
+          <Text as="span" variant="bodyMd" truncate>
+            {sourceLabelFor(article)}
+          </Text>
+        </InlineStack>
       </IndexTable.Cell>
       <IndexTable.Cell>
         <Text as="span" variant="bodyMd" truncate>
@@ -697,8 +742,9 @@ export default function Index() {
     <Page
       title="Page Tailor"
       primaryAction={{ content: "Add articles", url: "/app/articles/new" }}
-      secondaryActions={
-        generatableCount > 1
+      secondaryActions={[
+        { content: "Add briefs", url: "/app/briefs/new" },
+        ...(generatableCount > 1
           ? [
               {
                 content: `Generate all pending (${generatableCount})`,
@@ -709,8 +755,8 @@ export default function Index() {
                   ),
               },
             ]
-          : undefined
-      }
+          : []),
+      ]}
     >
       <Layout>
         <Layout.Section>
@@ -834,11 +880,11 @@ export default function Index() {
                 >
                   <div style={{ padding: "0.5rem 1rem" }}>
                     <BlockStack gap="200">
-                      <InlineGrid columns={{ xs: 1, md: 4 }} gap="200">
+                      <InlineGrid columns={{ xs: 1, md: 5 }} gap="200">
                         <TextField
                           label="Search articles"
                           labelHidden
-                          placeholder="Search by product, article, or query"
+                          placeholder="Search by product, article, brief, or query"
                           value={searchQuery}
                           onChange={setSearchQuery}
                           autoComplete="off"
@@ -858,6 +904,13 @@ export default function Index() {
                           options={localeOptions}
                           value={localeFilter}
                           onChange={setLocaleFilter}
+                        />
+                        <Select
+                          label="Source"
+                          labelHidden
+                          options={sourceOptions}
+                          value={sourceFilter}
+                          onChange={setSourceFilter}
                         />
                         <Select
                           label="Adaptation mode"
@@ -896,7 +949,7 @@ export default function Index() {
                     headings={[
                       { title: "Product" },
                       { title: "Language" },
-                      { title: "Article" },
+                      { title: "Article / brief" },
                       { title: "Detected query" },
                       { title: "Status" },
                       { title: "Actions" },
