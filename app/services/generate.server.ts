@@ -27,6 +27,15 @@ function client(): Anthropic {
   return _client;
 }
 
+/** The shared Claude client, for the illustration passes (recommend,
+ *  placement) that live in their own module. */
+export const claudeClient = client;
+
+/** Model for the illustration passes: its own variable, else the main one. */
+export function figureModel(): string {
+  return process.env.PAGE_TAILOR_FIGURE_MODEL?.trim() || MODEL;
+}
+
 const ANALYSIS_SCHEMA = {
   type: "object",
   properties: {
@@ -428,7 +437,7 @@ const REFINE_SCHEMA = {
  * into messages a merchant can act on. Both generation passes go through
  * this; a raw SyntaxError from truncated output is useless in the admin UI.
  */
-function extractJsonText(
+export function extractJsonText(
   response: Anthropic.Message,
   pass: string,
   subject: "article" | "brief" = "article",
@@ -449,7 +458,7 @@ function extractJsonText(
     .join("");
 }
 
-function parseModelJson(text: string, pass: string): unknown {
+export function parseModelJson(text: string, pass: string): unknown {
   try {
     return JSON.parse(text);
   } catch {
@@ -860,6 +869,7 @@ Apply the new instruction to the CURRENT copy:
 - The previous instructions still apply: do not undo an earlier change unless the new instruction says so.
 - If the instruction names a specific section or surface, change only that one; if it names none, change the fewest surfaces that satisfy it.
 - When the instruction asks for something the hard rules below forbid (an image, a link, a drug-like claim, altered question-and-answer markup), do as much as the rules allow and say in the notes what you did not do.
+- ILLUSTRATION MARKER: a surface's current copy may contain exactly one empty <div data-pt-figure="..."></div>. It marks where the page's illustration renders. Keep that element exactly as it is, in its place, with its attribute unchanged. Move it (as a whole, to another position between the section's blocks) only when the instruction explicitly asks to move the illustration or figure; never remove it, never duplicate it, never put text inside it, and never add any other image. An instruction about the illustration's caption or picture itself cannot be done here: say so in the notes (the merchant edits those in the figure panel).
 - The brief and the reference material give context and facts; the instruction is what to change now.
 
 For each changed surface, give one sentence of notes on what you changed; leave notes empty for unchanged surfaces. In summary, write 1-3 sentences on what changed and where.

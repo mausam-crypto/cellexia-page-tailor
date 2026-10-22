@@ -8,7 +8,9 @@ Cellexia product pages. For each article, Page Tailor generates a
 (e.g. `?cx=a7k2m9x4`). One URL per article. For branded campaigns with no
 article, a written **brief** does the same job (see [Briefs](#briefs-branded-campaigns)).
 The Shopify product itself is **never modified** — variants live only in the
-app's database and are swapped in client-side by a theme app embed.
+app's database and are swapped in client-side by a theme app embed. (The only
+thing the app writes to the store is image files for illustrations, in the
+store's Files.)
 
 There is no user-agent,
 referrer, or bot branching anywhere in the pipeline — deterministic per-URL
@@ -163,6 +165,47 @@ included:
   history included — so you can iterate on the copy while an ad keeps pointing
   at the original, or spin a sibling angle off a page you like.
 
+## Illustrations (Science and Overview tabs)
+
+Brief- and article-based pages can carry a clinical-style illustration in
+the Science and Overview tabs (any other HTML surface can be switched on in
+Settings). Three sources:
+
+- **Image library** (nav: *Image library*): upload PNG/JPEG/WebP illustrations
+  with a name, a "what it shows" description, tags and the language of any
+  labels inside. Files live in the store's own Shopify Files (CDN), which is
+  why the app asks for the `write_files` permission. Every image the app draws
+  lands here too, with the template, the full prompt and its cost.
+- **AI drawing** through OpenAI's image model (`OPENAI_API_KEY`): a
+  **template** (reusable drawing style with a category and a "when to use"
+  note, nav: *Templates*; eight editable starters are seeded) plus a
+  **specific prompt** for the image. Words, labelled figures and scientific
+  graphs inside the image are allowed; they are rendered in the page's
+  language, so a brief in three languages draws three images.
+- **Recommend**: one click proposes five template + prompt ideas from the
+  brief or article (and, on the review page, the section's current copy);
+  tick the ones to draw.
+
+Choose at creation time, per section (per brief in *Add briefs*; per batch in
+*Add articles*): none / **Auto** (Claude recommends and draws the best idea
+during generation, keeping the other four as suggestions) / a library image /
+a template + prompt. The copy is written first and goes live; the figure is
+then drawn (one to three minutes) and goes live with its caption, flagged for
+review like the copy. On the review page each section has an illustration
+panel: swap for an alternative or a library image, draw again, move the
+figure, edit the caption and alt text, remove it, or retry a failed drawing.
+Claude places the figure and writes the caption and alt text in the page's
+language; the claim guard reads caption, alt and drawing prompt and lists
+anything unsupported under *Unverified claims* (information only; a chart may
+carry illustrative numbers, by design). Refine keeps the figure (moves it on
+request, never redraws); Start over re-places it; Duplicate and version
+history carry it. A failed drawing never blocks the copy: the section shows
+the reason and a *Try again* button.
+
+Settings: drawing quality (default High, about 5 cents per image), an
+optional monthly budget (drawing pauses when reached), a house-style text
+added to every prompt, and the per-surface "Allow illustrations" switch.
+
 ## Experiment tracker
 
 Measures the impact of serving variants for one product + language by comparing
@@ -201,7 +244,12 @@ re-consent to the new scope.
 | --- | --- | --- | --- |
 | `ANTHROPIC_API_KEY` | Yes | — | Claude API key used for generation and the claim guard |
 | `PAGE_TAILOR_MODEL` | No | `claude-opus-4-8` | Model used for both passes |
+| `PAGE_TAILOR_FIGURE_MODEL` | No | `PAGE_TAILOR_MODEL` | Claude model for the illustration recommender and figure placement |
+| `OPENAI_API_KEY` | For drawing | — | OpenAI key for drawing illustrations (library and uploads work without it) |
+| `OPENAI_IMAGE_MODEL` | No | `gpt-image-2.5-sunburst` | OpenAI image model |
 
 `SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`, and `SCOPES` are managed by the Shopify
 CLI during `npm run dev`; see [.env.example](.env.example) for manual/production
-setups.
+setups. Scopes: `read_products`, `read_translations`, `read_locales`,
+`read_orders`, and `write_files` (illustrations are stored in the store's
+Files; the app writes nothing else to the store).

@@ -15,6 +15,19 @@ import {
   normalizeGeneratedPunctuation,
   refineFromBrief,
 } from "./generate.server";
+import {
+  buildFigureHtml,
+  composeFigure,
+  hasMarker,
+  imageSrcsOf,
+  insertMarker,
+  locateMarker,
+  MARKER_ATTR,
+  MARKER_VALUE_RE,
+  markerValueFor,
+  removeMarker,
+} from "./figure-markup";
+import { figureJobAfterGeneration, runFigureJob } from "./illustrations.server";
 import { getSettings, unsafeSelectorReason } from "./settings.server";
 import {
   getLocalizedSurfaceContent,
@@ -26,11 +39,15 @@ import {
 } from "./shopify-data.server";
 import {
   BRIEF_ADVANCED_FIELDS,
+  illustrationsAllowed,
   normalizeAdaptationMode,
   normalizeBriefAdvanced,
+  parseFigureJob,
+  parseIllustrationPlan,
   type BriefAdvanced,
   type ClaimFindings,
   type CopySurface,
+  type IllustrationPlan,
   type ShopSettingsData,
   type SurfaceContent,
   type SurfaceSnapshot,
@@ -58,10 +75,19 @@ const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
   // button: the theme's FAQ accordions use <button> question rows; without
   // it the sanitizer would flatten swapped FAQ markup. Attributes stay
   // restricted to class, so a served button carries no behavior of its own.
-  allowedTags: sanitizeHtml.defaults.allowedTags.concat(["img", "h1", "h2", "button"]),
+  // figure/figcaption: the served illustration; data-pt-figure: its marker.
+  allowedTags: sanitizeHtml.defaults.allowedTags.concat([
+    "img",
+    "h1",
+    "h2",
+    "button",
+    "figure",
+    "figcaption",
+  ]),
   allowedAttributes: {
     ...sanitizeHtml.defaults.allowedAttributes,
     img: ["src", "alt", "width", "height", "loading"],
+    div: [MARKER_ATTR],
     "*": ["class"],
   },
   // Approved copy only ever travels app-db -> storefront; still strip anything
@@ -69,8 +95,120 @@ const SANITIZE_OPTIONS: sanitizeHtml.IOptions = {
   disallowedTagsMode: "discard",
 };
 
-export function sanitizeAdaptedHtml(html: string): string {
-  return sanitizeHtml(html, SANITIZE_OPTIONS);
+/**
+ * Sanitize adapted HTML. Images are allowlisted, not banned: an <img> stays
+ * only when its src is one the theme region already had (pass the
+ * original's srcs) or, at serve time, the app's own figure URL. So a model
+ * or a hand edit can never introduce a picture; the figure marker is kept
+ * only with a well-formed value.
+ */
+export function sanitizeAdaptedHtml(
+  html: string,
+  options: { allowedImageSrcs?: string[] } = {},
+): string {
+  const allowed = new Set((options.allowedImageSrcs ?? []).map((s) => s.trim()));
+  return sanitizeHtml(html, {
+    ...SANITIZE_OPTIONS,
+    exclusiveFilter: (frame) => {
+      if (frame.tag === "img") {
+        return !allowed.has((frame.attribs.src ?? "").trim());
+      }
+      if (frame.tag === "div" && MARKER_ATTR in frame.attribs) {
+        return !MARKER_VALUE_RE.test(frame.attribs[MARKER_ATTR] ?? "");
+      }
+      return false;
+    },
+  });
+}
+
+/** Prefix on Article.errorMessage when a figure job (drawing/placing an
+ *  illustration) failed as a whole; per-surface failures live on the
+ *  Override rows instead and never touch the article. */
+export const ILLUSTRATION_FAILED_PREFIX = "Illustration failed: ";
+
+function emptyFigureFields() {
+  return {
+    figureImageId: null as string | null,
+    figureCaption: null as string | null,
+    figureAlt: null as string | null,
+    figureAlternatives: null as string | null,
+    figureSource: null as string | null,
+  };
+}
+
+/** Figure columns of the previous row for the same surface (a regeneration
+ *  keeps the illustration; the figure phase then re-places it). */
+function carriedFigureFields(
+  previousRows: Array<{
+    surfaceKey: string;
+    figureImageId: string | null;
+    figureCaption: string | null;
+    figureAlt: string | null;
+    figureAlternatives: string | null;
+    figureSource: string | null;
+  }>,
+  surfaceKey: string,
+) {
+  const prev = previousRows.find((r) => r.surfaceKey === surfaceKey);
+  if (!prev?.figureImageId) return emptyFigureFields();
+  return {
+    figureImageId: prev.figureImageId,
+    figureCaption: prev.figureCaption,
+    figureAlt: prev.figureAlt,
+    figureAlternatives: prev.figureAlternatives,
+    figureSource: prev.figureSource,
+  };
+}
+
+/**
+ * Figure phase after a generation from the base copy: draw or place the
+ * illustrations the creation form asked for (or keep the ones the variant
+ * had), once the copy is live. Takes the generation lock again for its
+ * duration (hand edits wait; the review page shows "drawing") and never
+ * fails the generation: per-surface problems land on the Override rows, a
+ * whole-phase crash on Article.errorMessage.
+ */
+async function runFigurePhase(
+  admin: AdminClient,
+  shop: string,
+  articleId: string,
+  settings: ShopSettingsData,
+  plan: IllustrationPlan,
+  previousRows: Array<{ surfaceKey: string; figureImageId: string | null }>,
+  newRows: Array<{ surfaceKey: string; mode: string }>,
+  versionNumber: number,
+): Promise<void> {
+  const job = figureJobAfterGeneration({
+    plan,
+    previousRows,
+    newRows,
+    surfaces: settings.surfaces,
+  });
+  if (!job) return;
+  const claimed = await prisma.article.updateMany({
+    where: { id: articleId, generatingAt: null },
+    data: { generatingAt: new Date(), pendingFigureJob: JSON.stringify(job) },
+  });
+  if (claimed.count === 0) return;
+  try {
+    await runFigureJob(admin, shop, articleId, job, {
+      patchVersionNumber: versionNumber,
+    });
+  } catch (error) {
+    console.error(`Figure phase failed for article ${articleId}`, error);
+    await prisma.article
+      .updateMany({
+        where: { id: articleId },
+        data: {
+          generatingAt: null,
+          pendingFigureJob: null,
+          errorMessage: `${ILLUSTRATION_FAILED_PREFIX}${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        },
+      })
+      .catch(() => {});
+  }
 }
 
 // V2 plan entries are generated copy shown on the review page: apply the
@@ -97,6 +235,9 @@ export async function createArticlesForProduct(
      *  time. "standard" | "subtle" | "meta" | "ultra" | "persona" | "max"
      *  | "v2". */
     mode?: string;
+    /** Illustration choices for every article in this batch (JSON
+     *  IllustrationPlan), applied by the figure phase after generation. */
+    illustrationPlan?: string | null;
   },
 ): Promise<string[]> {
   const product = await getProduct(admin, input.productId);
@@ -133,6 +274,7 @@ export async function createArticlesForProduct(
           sourceTitle: row.sourceTitle ?? null,
           sourceText: row.sourceText ?? null,
           mode: normalizeAdaptationMode(input.mode ?? "standard"),
+          illustrationPlan: input.illustrationPlan ?? null,
           status: "pending",
           variantHandle: generateVariantHandle(),
         },
@@ -174,6 +316,8 @@ export async function createBriefsForProduct(
       text: string;
       references?: string;
       advanced?: BriefAdvanced;
+      /** JSON IllustrationPlan for this brief (every language of it). */
+      illustrationPlan?: string | null;
     }>;
   },
 ): Promise<string[]> {
@@ -207,6 +351,7 @@ export async function createBriefsForProduct(
           briefReferences: brief.references?.trim() || null,
           briefAdvanced:
             Object.keys(advanced).length > 0 ? JSON.stringify(advanced) : null,
+          illustrationPlan: brief.illustrationPlan ?? null,
           mode: "standard",
           status: "pending",
           variantHandle: generateVariantHandle(),
@@ -254,12 +399,20 @@ export async function generateForArticle(
   // from the base copy. Decided up front so a failure is recorded under the
   // right label.
   const isBrief = article.sourceKind === "brief";
-  let runKind: "generate" | "refine" =
-    isBrief && (article.pendingRefinement ?? "").trim() !== ""
+  // A pending figure job (from the review page) draws or places an
+  // illustration without touching the copy at all.
+  const figureJob = parseFigureJob(article.pendingFigureJob);
+  let runKind: "generate" | "refine" | "figure" = figureJob
+    ? "figure"
+    : isBrief && (article.pendingRefinement ?? "").trim() !== ""
       ? "refine"
       : "generate";
 
   try {
+    if (runKind === "figure" && figureJob) {
+      await runFigureJob(admin, shop, article.id, figureJob);
+      return;
+    }
     const settings = await getSettings(shop);
     const locales = await getShopLocales(admin);
     const primary = locales.find((l) => l.primary)?.locale ?? "en";
@@ -425,11 +578,19 @@ export async function generateForArticle(
         return [
           pair.key,
           surface.surface.mode === "html"
-            ? sanitizeAdaptedHtml(dashFree)
+            ? sanitizeAdaptedHtml(dashFree, {
+                allowedImageSrcs: imageSrcsOf(pair.original),
+              })
             : dashFree,
         ] as const;
       }),
     );
+
+    // The copy this generation replaces: the "before" for version history,
+    // and the source of any illustration the variant already had.
+    const previousRows = await prisma.override.findMany({
+      where: { articleId: article.id },
+    });
 
     // Subtle-mode insertions are shown to the reviewer as "the sentence
     // exactly as it appears in the adapted copy" — same trust posture as
@@ -473,15 +634,13 @@ export async function generateForArticle(
           : null,
         unverifiedClaims: null,
         enabled: true,
+        ...carriedFigureFields(previousRows, pair.key),
       };
     });
 
     // Version history: the copy this generation replaces becomes the
     // "before" (a baseline is created lazily for pre-history articles) and
     // the new copy is recorded as the next version in the same transaction.
-    const previousRows = await prisma.override.findMany({
-      where: { articleId: article.id },
-    });
     const { number: versionNumber, previousSnapshot } = await prepareVersion(
       article.id,
       previousRows,
@@ -578,10 +737,21 @@ export async function generateForArticle(
           reviewedAt: null,
           errorMessage: null,
           generatingAt: null,
+          pendingFigureJob: null,
         },
       }),
     ]);
     await pruneVersions(article.id);
+    await runFigurePhase(
+      admin,
+      shop,
+      article.id,
+      settings,
+      parseIllustrationPlan(article.illustrationPlan),
+      previousRows,
+      overrideRows.map((r) => ({ surfaceKey: r.surfaceKey, mode: r.mode })),
+      versionNumber,
+    );
   } catch (error) {
     await recordGenerationFailure(article.id, error, runKind);
     throw error;
@@ -712,6 +882,12 @@ export function emptySectionProblem(html: string): string | null {
       let hasBody = false;
       for (let j = i + 1; j < children.length; j++) {
         if (isHeadingBlock(children[j])) break;
+        // An illustration marker is content: a heading followed by the
+        // figure is not a heading with nothing beneath it.
+        if ($(children[j]).is(`div[${MARKER_ATTR}]`)) {
+          hasBody = true;
+          break;
+        }
         if ($(children[j]).text().trim() !== "") {
           hasBody = true;
           break;
@@ -838,7 +1014,7 @@ export async function getVariantPayload(
       productHandle,
       status: "approved",
     },
-    include: { overrides: true },
+    include: { overrides: { include: { figureImage: true } } },
   });
   if (!article) return null;
   if (locale && !servedLocaleMatches(article.locale, locale)) {
@@ -868,11 +1044,37 @@ export async function getVariantPayload(
     )
     .map((o) => {
       const surface = currentSurfaces.get(o.surfaceKey)!;
+      if (surface.mode !== "html") {
+        return {
+          selector: surface.selector,
+          mode: "text" as const,
+          content: o.adapted,
+        };
+      }
+      // Theme images the region already had may stay; nothing else may.
+      const originalSrcs = imageSrcsOf(o.original);
+      let html = sanitizeAdaptedHtml(o.adapted, { allowedImageSrcs: originalSrcs });
+      if (o.figureImage && illustrationsAllowed(surface)) {
+        // The illustration replaces its marker (or leads the section when a
+        // hand edit removed the marker); the result is sanitized again with
+        // the figure's own URL allowed.
+        const figure = buildFigureHtml({
+          src: o.figureImage.cdnUrl,
+          alt: o.figureAlt ?? "",
+          width: o.figureImage.width,
+          height: o.figureImage.height,
+          caption: o.figureCaption ?? "",
+        });
+        html = sanitizeAdaptedHtml(composeFigure(html, figure), {
+          allowedImageSrcs: [...originalSrcs, o.figureImage.cdnUrl],
+        });
+      } else {
+        html = removeMarker(html);
+      }
       return {
         selector: surface.selector,
-        mode: surface.mode === "html" ? ("html" as const) : ("text" as const),
-        content:
-          surface.mode === "html" ? sanitizeAdaptedHtml(o.adapted) : o.adapted,
+        mode: "html" as const,
+        content: html,
       };
     })
     .filter(
@@ -933,9 +1135,21 @@ export const REFINEMENT_FAILED_PREFIX = "Refinement failed: ";
 async function recordGenerationFailure(
   articleId: string,
   error: unknown,
-  kind: "generate" | "refine",
+  kind: "generate" | "refine" | "figure",
 ): Promise<void> {
   const message = error instanceof Error ? error.message : String(error);
+  if (kind === "figure") {
+    // The copy was never touched: keep the status, say what failed.
+    await prisma.article.updateMany({
+      where: { id: articleId },
+      data: {
+        errorMessage: `${ILLUSTRATION_FAILED_PREFIX}${message}`,
+        generatingAt: null,
+        pendingFigureJob: null,
+      },
+    });
+    return;
+  }
   if (kind === "refine") {
     await prisma.article.updateMany({
       where: { id: articleId },
@@ -943,6 +1157,7 @@ async function recordGenerationFailure(
         errorMessage: `${REFINEMENT_FAILED_PREFIX}${message}`,
         generatingAt: null,
         pendingRefinement: null,
+        pendingFigureJob: null,
       },
     });
     return;
@@ -954,11 +1169,17 @@ async function recordGenerationFailure(
       errorMessage: message,
       generatingAt: null,
       pendingRefinement: null,
+      pendingFigureJob: null,
     },
   });
   await prisma.article.updateMany({
     where: { id: articleId, status: "approved" },
-    data: { errorMessage: message, generatingAt: null, pendingRefinement: null },
+    data: {
+      errorMessage: message,
+      generatingAt: null,
+      pendingRefinement: null,
+      pendingFigureJob: null,
+    },
   });
 }
 
@@ -1177,7 +1398,11 @@ async function runBriefPipeline(
     const surface = surfaces.find((s) => s.surface.key === pair.key)!;
     const dashFree = normalizeGeneratedPunctuation(pair.adapted);
     const adaptedContent =
-      surface.surface.mode === "html" ? sanitizeAdaptedHtml(dashFree) : dashFree;
+      surface.surface.mode === "html"
+        ? sanitizeAdaptedHtml(dashFree, {
+            allowedImageSrcs: imageSrcsOf(pair.original),
+          })
+        : dashFree;
     const visibleText =
       surface.surface.mode === "html"
         ? adaptedContent.replace(/<[^>]*>/g, "").trim()
@@ -1207,6 +1432,7 @@ async function runBriefPipeline(
       ]),
       unverifiedClaims: findingsJson(guardFindings?.warnings),
       enabled: true,
+      ...carriedFigureFields(existing, pair.key),
     };
   });
 
@@ -1237,10 +1463,21 @@ async function runBriefPipeline(
         errorMessage: null,
         generatingAt: null,
         pendingRefinement: null,
+        pendingFigureJob: null,
       },
     }),
   ]);
   await pruneVersions(article.id);
+  await runFigurePhase(
+    admin,
+    article.shop,
+    article.id,
+    settings,
+    parseIllustrationPlan(article.illustrationPlan),
+    existing,
+    overrideRows.map((r) => ({ surfaceKey: r.surfaceKey, mode: r.mode })),
+    number,
+  );
 }
 
 /**
@@ -1313,8 +1550,20 @@ async function runBriefRefinement(
       continue;
     }
     const dashFree = normalizeGeneratedPunctuation(r.adapted);
-    const adaptedContent =
-      o.mode === "html" ? sanitizeAdaptedHtml(dashFree) : dashFree;
+    let adaptedContent =
+      o.mode === "html"
+        ? sanitizeAdaptedHtml(dashFree, { allowedImageSrcs: imageSrcsOf(o.original) })
+        : dashFree;
+    // Deterministic backstop for the prompt's marker rule: the illustration
+    // marker survives every refinement, at its previous spot when the model
+    // dropped it.
+    if (o.mode === "html" && o.figureImageId && hasMarker(o.adapted) && !hasMarker(adaptedContent)) {
+      adaptedContent = insertMarker(
+        adaptedContent,
+        locateMarker(o.adapted) ?? { kind: "top" },
+        markerValueFor(o.surfaceKey),
+      );
+    }
     if (adaptedContent === o.adapted) continue;
     const visibleText =
       o.mode === "html"
@@ -1384,6 +1633,11 @@ async function runBriefRefinement(
       articleClaims: o.articleClaims,
       unverifiedClaims: o.unverifiedClaims,
       enabled: o.enabled,
+      figureImageId: o.figureImageId,
+      figureCaption: o.figureCaption,
+      figureAlt: o.figureAlt,
+      figureAlternatives: o.figureAlternatives,
+      figureSource: o.figureSource,
     };
     const change = changes.get(o.surfaceKey);
     if (!change) return base;
@@ -1430,6 +1684,7 @@ async function runBriefRefinement(
         errorMessage: null,
         generatingAt: null,
         pendingRefinement: null,
+        pendingFigureJob: null,
       },
     }),
   ]);
@@ -1491,6 +1746,7 @@ export async function duplicateArticle(
         conversionPlan: source.conversionPlan,
         v2Plan: source.v2Plan,
         subtlePlan: source.subtlePlan,
+        illustrationPlan: source.illustrationPlan,
         mode: source.mode,
         generatedMode: source.generatedMode,
         status,

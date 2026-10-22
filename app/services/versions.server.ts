@@ -1,5 +1,10 @@
 import prisma from "../db.server";
-import type { SurfaceSnapshot, VersionKind } from "./types";
+import { removeMarker } from "./figure-markup";
+import {
+  parseFigureAlternatives,
+  type SurfaceSnapshot,
+  type VersionKind,
+} from "./types";
 
 /**
  * Version history for a variant's copy.
@@ -29,6 +34,11 @@ export type OverrideLike = {
   articleClaims: string | null;
   unverifiedClaims: string | null;
   enabled: boolean;
+  figureImageId?: string | null;
+  figureCaption?: string | null;
+  figureAlt?: string | null;
+  figureAlternatives?: string | null;
+  figureSource?: string | null;
 };
 
 /** Snapshot override rows (sorted by surface key so two snapshots of the
@@ -48,6 +58,11 @@ export function snapshotOverrides(rows: OverrideLike[]): SurfaceSnapshot[] {
       articleClaims: o.articleClaims ?? null,
       unverifiedClaims: o.unverifiedClaims ?? null,
       enabled: o.enabled,
+      figureImageId: o.figureImageId ?? null,
+      figureCaption: o.figureCaption ?? null,
+      figureAlt: o.figureAlt ?? null,
+      figureAlternatives: o.figureAlternatives ?? null,
+      figureSource: o.figureSource ?? null,
     }));
 }
 
@@ -75,6 +90,15 @@ export function parseSnapshot(json: string | null): SurfaceSnapshot[] {
         unverifiedClaims:
           typeof s.unverifiedClaims === "string" ? s.unverifiedClaims : null,
         enabled: s.enabled !== false,
+        figureImageId:
+          typeof s.figureImageId === "string" && s.figureImageId !== ""
+            ? s.figureImageId
+            : null,
+        figureCaption: typeof s.figureCaption === "string" ? s.figureCaption : null,
+        figureAlt: typeof s.figureAlt === "string" ? s.figureAlt : null,
+        figureAlternatives:
+          typeof s.figureAlternatives === "string" ? s.figureAlternatives : null,
+        figureSource: typeof s.figureSource === "string" ? s.figureSource : null,
       }))
       .filter((s) => s.surfaceKey !== "");
   } catch {
@@ -94,7 +118,14 @@ export function changedSurfaceLabels(
   const labels: string[] = [];
   for (const s of next) {
     const p = prevByKey.get(s.surfaceKey);
-    if (!p || p.adapted !== s.adapted || p.enabled !== s.enabled) {
+    if (
+      !p ||
+      p.adapted !== s.adapted ||
+      p.enabled !== s.enabled ||
+      (p.figureImageId ?? null) !== (s.figureImageId ?? null) ||
+      (p.figureCaption ?? null) !== (s.figureCaption ?? null) ||
+      (p.figureAlt ?? null) !== (s.figureAlt ?? null)
+    ) {
       labels.push(s.label);
     }
     prevByKey.delete(s.surfaceKey);
@@ -211,7 +242,7 @@ export async function restoreVersion(
   shop: string,
   articleId: string,
   number: number,
-): Promise<{ restoredFrom: number; newNumber: number }> {
+): Promise<{ restoredFrom: number; newNumber: number; notice: string | null }> {
   const article = await prisma.article.findFirst({
     where: { id: articleId, shop },
     include: { overrides: true },
@@ -224,6 +255,42 @@ export async function restoreVersion(
   const snapshot = parseSnapshot(version.surfaces);
   if (snapshot.length === 0) {
     throw new Error("That version holds no copy to restore.");
+  }
+  // An illustration whose library image has since been deleted cannot come
+  // back: the figure is dropped from that surface (the copy still restores)
+  // and the caller is told.
+  let notice: string | null = null;
+  const wantedImages = new Set<string>();
+  for (const s of snapshot) {
+    if (s.figureImageId) wantedImages.add(s.figureImageId);
+    for (const id of parseFigureAlternatives(s.figureAlternatives).images) {
+      wantedImages.add(id);
+    }
+  }
+  if (wantedImages.size > 0) {
+    const existing = await prisma.illustrationImage.findMany({
+      where: { id: { in: [...wantedImages] }, shop },
+      select: { id: true },
+    });
+    const ok = new Set(existing.map((e) => e.id));
+    for (const s of snapshot) {
+      const alternatives = parseFigureAlternatives(s.figureAlternatives);
+      const keptImages = alternatives.images.filter((id) => ok.has(id));
+      if (keptImages.length !== alternatives.images.length) {
+        s.figureAlternatives = JSON.stringify({
+          images: keptImages,
+          suggestions: alternatives.suggestions,
+        });
+      }
+      if (s.figureImageId && !ok.has(s.figureImageId)) {
+        s.figureImageId = null;
+        s.figureCaption = null;
+        s.figureAlt = null;
+        s.figureSource = null;
+        s.adapted = removeMarker(s.adapted);
+        notice = `The illustration of "${s.label}" in that version is no longer in the image library, so it was not restored.`;
+      }
+    }
   }
   const { number: newNumber, previousSnapshot } = await prepareVersion(
     articleId,
@@ -247,5 +314,5 @@ export async function restoreVersion(
     }),
   ]);
   await pruneVersions(articleId);
-  return { restoredFrom: number, newNumber };
+  return { restoredFrom: number, newNumber, notice };
 }

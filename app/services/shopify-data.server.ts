@@ -38,7 +38,7 @@ export interface ShopLocale {
   published: boolean;
 }
 
-async function gql<T>(
+export async function gql<T>(
   admin: AdminClient,
   query: string,
   variables?: Record<string, unknown>,

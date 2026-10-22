@@ -3,7 +3,39 @@
 This guide is for updating an already-deployed installation. For first-time
 setup, use [INSTALL.md](INSTALL.md).
 
-## What's new in this update (2026-10-21 — briefs, refinements, version history)
+## What's new in this update (2026-10-21 — illustrations)
+
+Brief- and article-based pages can now carry a clinical-style illustration in
+the Science and Overview tabs. This release ships **one database migration**
+(`illustrations`), **a theme-extension change** (`npm run deploy` required),
+**one new access scope** (`write_files`; merchants approve it on their next
+visit to the app) and **two new environment variables** (`OPENAI_API_KEY`
+for drawing, optional `OPENAI_IMAGE_MODEL`). See README → *Illustrations*
+for the feature itself; in short:
+
+- **Image library** (nav): upload illustrations (PNG/JPEG/WebP, stored in
+  the store's Shopify Files), describe them, see where each is used, delete
+  unused ones. Monthly drawing spend is shown here.
+- **Templates** (nav): eight editable starter drawing styles with a
+  category and a "when to use" note; add your own; archive unused ones.
+- **Creation forms**: per section (Science, Overview) choose none / Auto /
+  a library image / a template + prompt, with a one-click *Recommend 5
+  ideas*. Per brief in *Add briefs*, per batch in *Add articles*. The last
+  choice is remembered as the default.
+- **Generation**: the copy is written and goes live first; the figure is
+  then drawn (one image per language page, labels in that language), placed
+  by Claude with a caption, and goes live flagged for review. Failures never
+  block the copy (per-section banner with *Try again*).
+- **Review page**: an illustration panel per section: pick from the library,
+  draw (with Recommend), draw again, use an alternative, move the figure,
+  edit caption and alt text, remove. Figures are part of version history,
+  Restore, Duplicate, Refine (kept; moved on request) and Start over (kept).
+- **Settings**: drawing quality, monthly budget, house-style text, and a
+  per-surface *Allow illustrations* switch.
+- **Claim guard**: caption, alt text and drawing prompt are checked and
+  listed under *Unverified claims* (information only).
+
+## What's new in the previous update (2026-10-21 — briefs, refinements, version history)
 
 This release adds a second way to create variants and a history for every
 variant. It **ships one database migration** (`briefs_and_versions`), **no
@@ -33,7 +65,7 @@ theme-extension changes, no scope or config changes**.
 - Dashboard: *Brief* badge and brief name in the Article column, a *Source*
   filter (Articles / Briefs), a *Source* column in the CSV export.
 
-## What's new in the previous update (2026-09-19 — performance & reliability)
+## What's new in the update before that (2026-09-19 — performance & reliability)
 
 This is a server-only performance release. No new features, **no database
 migrations, no theme-extension changes, no scope or config changes** — the
@@ -72,8 +104,11 @@ admin just opens and navigates much faster and stops dying on slow hosts.
    - `shopify.app.toml` - keep yours (it has the real `client_id`,
      `application_url`, `[auth] redirect_urls`, `[app_proxy] url`). If you
      overwrite it by accident, re-add those four values or run
-     `npm run shopify -- app config link`.
-   - `.env` - not in the ZIP; keep yours.
+     `npm run shopify -- app config link`. **This release changes the
+     scopes line:** in YOUR copy set
+     `scopes = "read_products,read_translations,read_locales,read_orders,write_files"`.
+   - `.env` - not in the ZIP; keep yours, and add `OPENAI_API_KEY=...` (and
+     `write_files` to `SCOPES`, which must match the toml).
    - The production SQLite database volume - untouched by this update.
 2. **Replace the code.** Unzip over your working copy (everything except the
    files above is safe to replace wholesale), or diff-and-merge if you have
@@ -87,12 +122,14 @@ admin just opens and navigates much faster and stops dying on slow hosts.
    ```
 
 4. **Redeploy the server** the same way it was first deployed (e.g. push to
-   Render). The Prisma client is generated at build time (Dockerfile /
-   npm install); the boot command (`npm run docker-start`) runs
-   `prisma migrate deploy`, which applies this release's one migration
-   (`briefs_and_versions`: new nullable columns on Article and Override, a
-   new VariantVersion table, and a one-line backfill that marks pasted
-   articles as such). Existing variants and their live copy are untouched.
+   Render), with the new environment variables set on the host:
+   `OPENAI_API_KEY` (drawing; the app runs without it, drawing is then
+   unavailable) and `SCOPES` including `write_files`. The Prisma client is
+   generated at build time (Dockerfile / npm install); the boot command
+   (`npm run docker-start`) runs `prisma migrate deploy`, which applies this
+   release's one migration (`illustrations`: three new tables, nullable
+   columns on Article and Override, one defaulted column on ShopSettings).
+   Existing variants and their live copy are untouched.
 5. **On the host (Render dashboard):** set the service's **Health Check
    Path** to `/healthz`, so deploys only switch over once the new server
    actually serves. While there, check the instance type: on a free
@@ -100,8 +137,13 @@ admin just opens and navigates much faster and stops dying on slow hosts.
    free instance hours; an always-on paid instance is the clean fix (then
    set `PAGE_TAILOR_KEEP_ALIVE=off`). Also confirm a persistent disk backs
    the SQLite file — without one, app data resets on restarts.
-6. **Theme extension: nothing to do.** This release changes no extension
-   files, so `npm run deploy` is not needed (running it anyway is harmless).
+6. **Theme extension and scopes: run `npm run deploy`.** The embed gained
+   the illustration styling (`.pt-figure`), and the deploy also pushes the
+   new `write_files` scope to Shopify. Merchants are prompted to approve the
+   updated permissions the next time they open the app; until they do, the
+   Image library shows a "Files permission needed" banner and drawings fail
+   with that message (copy generation is unaffected). Open the app once
+   after deploying and accept.
 
 ## Post-update verification
 
@@ -116,8 +158,80 @@ admin just opens and navigates much faster and stops dying on slow hosts.
 4. Queue a generation and, while it runs, click around the admin: pages
    keep loading normally (WAL mode - reads no longer block on the
    generation's writes).
-5. Run the brief-feature checklist below once on a development store
-   before (or right after) the production deploy.
+5. Run the illustrations checklist below once on a development store
+   before (or right after) the production deploy (the brief-feature
+   checklist further down still applies if it was never run).
+
+## Testing the illustrations feature (2026-10-21 release)
+
+Prerequisites on the test store: theme app embed enabled (after
+`npm run deploy`), serving ON in Settings, the storefront password removed,
+`ANTHROPIC_API_KEY` and `OPENAI_API_KEY` set, the app opened once so the
+Files permission was approved. Each step says what you should see; anything
+else is a bug. Drawings cost a few cents each.
+
+1. **Image library** (nav) loads with no permission banner. Upload a 2 MB
+   PNG with a name, a description, two tags and a language: it appears
+   with its pixel size, and shows up in Shopify admin → Content → Files. A
+   12 MB file and a `.gif` are refused with a clear message.
+2. **Templates** (nav) lists eight starters. Edit one's "when to use" and
+   save; reload: the edit persists; *Reset to starter text* restores it.
+   Archive one: it moves to the Archived list and no longer appears in the
+   forms.
+3. **Settings**: Science and Overview show *Allow illustrations* ticked by
+   default, other surfaces unticked. Set quality High, monthly budget 5,
+   a house-style line; save; reload: all kept.
+4. **Add briefs**: pick a product, tick two languages, one brief. For
+   Science choose *Draw from a template and a prompt*, click *Recommend 5
+   ideas* (a few seconds, five ideas with the first ticked), tick a second
+   one. For Overview choose *An image from the library* and pick the upload
+   from step 1 (a warning says it is tagged with one language but used on
+   both). Submit. Dashboard: two rows *Queued*, then *Live — review
+   needed*; opening one shows "Illustrating" for a minute or two, then:
+   the Science card has a figure captioned in that page's language (two
+   drawings, the second under *Alternatives*), the Overview card has the
+   library image with a caption; the Image library lists the drawn images
+   with template, prompt and cost, and the month's spend went up; the
+   version history has ONE *Generated* version (no extra version for the
+   figure); *Unverified claims* may list items marked "Illustration:".
+5. **Storefront**: the `?cx=` URL shows the figure full width inside the
+   Science tab at the chosen spot, with its caption; the clean URL is
+   unchanged. Changes below reach the storefront within ~2–4 minutes.
+6. **Review page, Science card**: change *Position* to another block and
+   *Save illustration*: the storefront moves it; history shows *Edited:
+   Science … illustration*. Edit the caption and save. Click *Use this* on
+   the alternative: "Placing…", then the other image is live with a new
+   caption. *Draw another* → *Recommend* works on the existing copy; tick
+   one, *Draw it*: a new drawing goes live, the previous one becomes an
+   alternative; the status is back to *review needed*. *Remove*: figure
+   and caption gone from the page and the storefront.
+7. **Refine** (brief page) with "Shorten the overview": the Overview figure,
+   caption and position are unchanged. Refine with "move the Science
+   illustration below the second paragraph": it moves, nothing is redrawn,
+   no cost added.
+8. **Start over**: new copy, the same images re-placed with fresh captions,
+   no new drawing cost.
+9. **Restore** the first version (before any figure edits), then the latest:
+   figures follow each version. Delete an alternative image from the
+   library first, then restore a version that used it: the copy restores
+   and a message says that illustration was dropped.
+10. **Duplicate**: the copy carries both figures; the Image library's *Used
+    in* lists both pages.
+11. **Delete guard**: the image used on a live page cannot be deleted
+    (button disabled, detail page lists the pages); remove it from the page
+    first, then delete: it disappears from Shopify Files too.
+12. **Failures**: set a wrong `OPENAI_API_KEY`, restart, *Draw again*: the
+    copy stays live, the section shows the reason and *Try again*, the
+    dashboard row is NOT marked failed. Set the budget to 0.01: a drawing
+    shows "budget reached"; a library pick still works. Restore the key and
+    budget and *Try again*: it succeeds.
+13. **Add articles** with two URLs, Science = Auto, Overview = none: both
+    pages generate with a Science figure each, drawn from their own
+    article, with four un-drawn suggestions listed under *Alternatives*
+    (*Draw this* draws one).
+14. **Mark as reviewed** in a tab opened before a drawing finished: "copy
+    changed since you loaded this page"; reload; works.
+15. Open the dashboard CSV export and the Experiments pages: unchanged.
 
 ## Testing the brief feature (2026-10-21 release)
 
@@ -189,8 +303,20 @@ review page now shows a *Version history* with a baseline version
   to keep such hosts awake (disable with `PAGE_TAILOR_KEEP_ALIVE=off`);
   an always-on instance is still the most reliable option for batch
   generation.
-- Rollback: redeploy the previous server build. The migration only adds
-  nullable columns and one new table, which the previous build ignores, so
+- Rollback: redeploy the previous server build. The migrations only add
+  nullable columns and new tables, which the previous build ignores, so
   the database needs no changes to roll back; brief-based variants created
-  on this release would then show as pasted articles in the old UI, so
-  take them offline (or delete them) before rolling back.
+  on the briefs release would then show as pasted articles in the old UI,
+  so take them offline (or delete them) before rolling back. Illustrations:
+  the previous build does not know the figure marker (its sanitizer strips
+  the empty `<div data-pt-figure>`), so illustrated pages simply serve
+  without their figures; the images stay in the store's Files.
+- Illustrations and languages: a drawn figure's labels are in the language
+  of its page, so a brief in three languages draws three images (three
+  times the cost). A library image chosen in a creation form is used on
+  every language of that brief; swap it per language on the review page.
+- Illustration cost: computed from the image model's usage figures per
+  drawing (about $0.05 at High quality for a landscape image); the Image
+  library and Settings show the month's total. The monthly budget is
+  checked before each drawing, so a batch can overshoot it by the drawings
+  already in flight.

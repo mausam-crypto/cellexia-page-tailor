@@ -49,7 +49,9 @@ npm run dev
 The CLI opens a tunnel, rewrites the app URL and the app proxy URL
 automatically, and prompts you to install the app on the store. Approve the
 scope grant (`read_products`, `read_translations`, `read_locales`,
-`read_orders` — all read-only; the app never writes to the store).
+`read_orders`, and `write_files` — the app never writes to products,
+metafields, orders or translations; `write_files` is only for storing
+illustration images in the store's Files).
 
 > **The admin UI only loads while `npm run dev` is running** (in development
 > the app URL points at the CLI tunnel). If the app is opened in the Admin
@@ -106,8 +108,12 @@ the pages where you work").
      are also visible in the Dev/Partner dashboard under the app's client
      credentials, for whoever created the app)
    - `SHOPIFY_APP_URL` = `https://<your-host>`
-   - `SCOPES=read_products,read_translations,read_locales,read_orders`
-   - `ANTHROPIC_API_KEY` (and optionally `PAGE_TAILOR_MODEL`)
+   - `SCOPES=read_products,read_translations,read_locales,read_orders,write_files`
+   - `ANTHROPIC_API_KEY` (and optionally `PAGE_TAILOR_MODEL`,
+     `PAGE_TAILOR_FIGURE_MODEL`)
+   - `OPENAI_API_KEY` for drawing illustrations (optional: without it the
+     image library and uploads still work, drawing does not; optionally
+     `OPENAI_IMAGE_MODEL`, default `gpt-image-2.5-sunburst`)
    - Optional: `PAGE_TAILOR_KEEP_ALIVE=off` disables the built-in keep-alive
      self-ping (see the hosting note below).
 2. **Database:** the Prisma datasource is SQLite (`prisma/dev.sqlite`). In

@@ -24,10 +24,106 @@ model ShopSettings {
   // Subtle-intent mode dials as a JSON object (SubtleModeSettings); "{}"
   // means every dial at its conservative default. Read at generation time.
   subtleSettings String   @default("{}")
+  // Illustration settings as JSON (IllustrationSettings): drawing quality,
+  // optional monthly spending cap, house-style text, remembered form choices.
+  illustrationSettings String @default("{}")
   // Master kill switch. OFF by default: a fresh install never changes
   // anything on the storefront until the merchant explicitly enables serving.
   servingEnabled Boolean  @default(false)
   updatedAt      DateTime @updatedAt
+}
+
+// A reusable drawing style for AI illustrations: category + "when to use"
+// are what the recommender reads; instructions are prepended to the
+// specific prompt of every drawing made with the template.
+model IllustrationTemplate {
+  id             String   @id @default(cuid())
+  shop           String
+  // Stable key of a starter template (null for merchant-created ones), so
+  // the starter set can be seeded once per shop and never re-created after
+  // the merchant deletes or edits it.
+  seedKey        String?
+  name           String
+  category       String
+  whenToUse      String
+  instructions   String
+  shape          String   @default("landscape") // landscape | square | portrait
+  exampleImageId String?
+  exampleImage   IllustrationImage? @relation("TemplateExample", fields: [exampleImageId], references: [id], onDelete: SetNull)
+  sortOrder      Int      @default(0)
+  archived       Boolean  @default(false)
+  images         IllustrationImage[] @relation("DrawnFromTemplate")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([shop, seedKey])
+  @@index([shop])
+}
+
+// One illustration in the shop's library: uploaded by the merchant or drawn
+// by the image model. The file itself lives in the store's Shopify Files
+// (CDN); this row holds its coordinates plus, for drawn images, everything
+// needed to draw it again.
+model IllustrationImage {
+  id               String   @id @default(cuid())
+  shop             String
+  kind             String   // upload | drawn
+  name             String
+  description      String   @default("") // "what it shows"; read by the recommender and the placement pass
+  tags             String   @default("[]") // JSON string[]
+  language         String?  // optional locale tag (labels inside the image are in this language)
+  shopifyFileId    String   // gid://shopify/MediaImage/...
+  cdnUrl           String
+  width            Int
+  height           Int
+  mimeType         String
+  bytes            Int?
+  // Drawn images only.
+  templateId       String?
+  template         IllustrationTemplate? @relation("DrawnFromTemplate", fields: [templateId], references: [id], onDelete: SetNull)
+  specificPrompt   String?
+  finalPrompt      String?
+  rationale        String?
+  model            String?
+  quality          String?
+  size             String?
+  costUsd          Float?
+  sourceArticleId  String?  // informational only (the variant may be deleted later)
+  sourceSurfaceKey String?
+  overrides        Override[]
+  exampleOf        IllustrationTemplate[] @relation("TemplateExample")
+  charges          IllustrationCharge[]
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([shop, createdAt])
+  @@index([shop, kind])
+}
+
+// Ledger of billed image-model calls (one row per drawing attempt that was
+// charged, including a drawing whose upload to Shopify then failed). The
+// month's illustration spend is the sum of costUsd since the first of the
+// month (UTC).
+model IllustrationCharge {
+  id           String   @id @default(cuid())
+  shop         String
+  imageId      String?
+  image        IllustrationImage? @relation(fields: [imageId], references: [id], onDelete: SetNull)
+  articleId    String?
+  surfaceKey   String?
+  model        String
+  quality      String
+  size         String
+  inputTokens  Int?
+  outputTokens Int?
+  costUsd      Float
+  // True when the API returned no usage figures and the cost is a table
+  // estimate rather than the exact amount.
+  estimated    Boolean  @default(false)
+  status       String   // ok | upload_failed
+  createdAt    DateTime @default(now())
+
+  @@index([shop, createdAt])
 }
 
 // One row per (day, product, locale): storefront page views recorded by the
@@ -118,6 +214,15 @@ model Article {
   // explicitly (instruction or null), so a value left behind by a crashed
   // run can never be mis-applied by a later plain generation.
   pendingRefinement String?
+  // Illustration choices made in the creation form, per surface key
+  // (IllustrationPlan JSON): none / auto / a library image / a template with
+  // one or more prompts to draw. Read by the figure phase that follows
+  // every generation from the base copy.
+  illustrationPlan  String?
+  // A figure job waiting for the background queue (FigureJob JSON): draw or
+  // place an illustration without touching the copy. Written explicitly on
+  // every enqueue, like pendingRefinement.
+  pendingFigureJob  String?
   detectedQuery String?
   queryVariants String? // JSON string[]
   evidence      String? // JSON string[] of article phrases supporting the query inference
@@ -189,6 +294,18 @@ model Override {
   // generation or refinement replaces the row.
   unverifiedClaims String? // JSON string[]
   enabled       Boolean @default(true)
+  // Illustration placed in this surface. It renders at the
+  // <div data-pt-figure> marker inside `adapted` (at the top of the section
+  // when the marker is missing). Restrict: a library image in use on a live
+  // page cannot be deleted.
+  figureImageId      String?
+  figureImage        IllustrationImage? @relation(fields: [figureImageId], references: [id], onDelete: Restrict)
+  figureCaption      String?
+  figureAlt          String?
+  figureAlternatives String? // JSON FigureAlternatives: other drawn images + un-drawn suggestions
+  figureSource       String? // library | drawn | auto
+  figureError        String? // why the last drawing/placement failed; shown on the review page
+  figureLastJob      String? // JSON SurfaceFigureJob of the last attempt, for "Try again"
 
   @@unique([articleId, surfaceKey])
 }
@@ -203,7 +320,7 @@ model VariantVersion {
   articleId       String
   article         Article  @relation(fields: [articleId], references: [id], onDelete: Cascade)
   number          Int // 1-based, per article
-  kind            String // generate | refine | edit | restore | duplicate
+  kind            String // generate | refine | edit | restore | duplicate | figure
   // refine: the merchant's instruction; edit: "Edited: <labels>";
   // duplicate: "Duplicated from <name>"; generate/restore: null.
   instruction     String?

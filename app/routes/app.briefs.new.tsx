@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
 import {
@@ -29,11 +29,31 @@ import {
 } from "../services/shopify-data.server";
 import { createBriefsForProduct } from "../services/variant.server";
 import { enqueueGeneration } from "../services/generation-queue.server";
+import { getSettings, saveSettings } from "../services/settings.server";
+import {
+  illustrationFormData,
+  sanitizeIllustrationPlan,
+} from "../services/illustrations.server";
+import {
+  imageModelConfigured,
+  typicalCostUsd,
+} from "../services/openai-images.server";
 import {
   BRIEF_ADVANCED_FIELDS,
+  illustrationsAllowed,
   normalizeBriefAdvanced,
   type BriefAdvanced,
+  type FormChoiceMemory,
 } from "../services/types";
+import {
+  IllustrationChoice,
+  choiceToMemory,
+  choiceToSubmission,
+  emptyChoice,
+  requestRecommendations,
+  type ChoiceUpdater,
+  type IllustrationChoiceDraft,
+} from "../components/IllustrationChoice";
 
 const MAX_NAME_CHARS = 120;
 const MAX_BRIEF_CHARS = 20_000;
@@ -48,6 +68,8 @@ type BriefInput = {
   text: string;
   references: string;
   advanced: BriefAdvanced;
+  /** Raw illustration choices per surface; validated against the shop later. */
+  illustrations: unknown;
 };
 
 /** Parse the submitted briefs defensively: the client sends JSON, but the
@@ -92,7 +114,7 @@ function normalizeBriefInput(raw: string): { briefs: BriefInput[]; error: string
         return { briefs: [], error: `"${label}" for "${name}" is too long (max ${MAX_ADVANCED_CHARS.toLocaleString("en-US")} characters).` };
       }
     }
-    briefs.push({ name, text, references, advanced });
+    briefs.push({ name, text, references, advanced, illustrations: r.illustrations });
   }
   if (briefs.length === 0) {
     return { briefs: [], error: "Add at least one brief with a name and text." };
@@ -100,17 +122,60 @@ function normalizeBriefInput(raw: string): { briefs: BriefInput[]; error: string
   return { briefs, error: null };
 }
 
+/** The brief as the recommender should read it (same shape the generation
+ *  composes server-side, plus the pasted references). */
+function composeBriefText(brief: {
+  name: string;
+  text: string;
+  references: string;
+  audience: string;
+  keyMessage: string;
+  tone: string;
+  mustSay: string;
+  mustAvoid: string;
+}): string {
+  const extras = [
+    ["Audience", brief.audience],
+    ["Key message", brief.keyMessage],
+    ["Tone", brief.tone],
+    ["Must say", brief.mustSay],
+    ["Must avoid", brief.mustAvoid],
+  ]
+    .filter(([, v]) => v.trim())
+    .map(([k, v]) => `${k}: ${v.trim()}`);
+  return [
+    brief.name.trim() ? `Campaign: ${brief.name.trim()}` : "",
+    brief.text.trim(),
+    ...extras,
+    brief.references.trim() ? `References:\n${brief.references.trim()}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
+  const settings = await getSettings(session.shop);
+  const { templates, images } = await illustrationFormData(session.shop);
+  const illustration = {
+    surfaces: settings.surfaces
+      .filter((s) => s.enabled && s.selector.trim() !== "" && illustrationsAllowed(s))
+      .map((s) => ({ key: s.key, label: s.label })),
+    templates,
+    images,
+    lastChoice: settings.illustrations.lastFormChoice.briefs,
+    openaiConfigured: imageModelConfigured(),
+    costPerImage: typicalCostUsd(settings.illustrations.quality),
+  };
   // Same degradation as "Add articles": a transient Admin API failure shows
   // a banner instead of an error boundary. Cached after the first load.
   try {
     const locales = (
       await getShopLocalesCached(admin, session.shop)
     ).filter((l) => l.published);
-    return { locales, localesUnavailable: false };
+    return { locales, localesUnavailable: false, illustration };
   } catch {
-    return { locales: [], localesUnavailable: true };
+    return { locales: [], localesUnavailable: true, illustration };
   }
 };
 
@@ -153,18 +218,60 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     };
   }
 
+  // Illustration choices: validated against the shop's sections, images and
+  // templates; a choice that no longer makes sense is simply dropped.
+  const settings = await getSettings(session.shop);
+  const allowedKeys = settings.surfaces
+    .filter((s) => s.enabled && illustrationsAllowed(s))
+    .map((s) => s.key);
+  const briefsWithPlans = [];
+  for (const brief of briefs) {
+    const plan = await sanitizeIllustrationPlan(
+      session.shop,
+      brief.illustrations,
+      allowedKeys,
+    );
+    briefsWithPlans.push({
+      name: brief.name,
+      text: brief.text,
+      references: brief.references,
+      advanced: brief.advanced,
+      illustrationPlan: Object.keys(plan).length > 0 ? JSON.stringify(plan) : null,
+    });
+  }
+
   let createdIds: string[];
   try {
     createdIds = await createBriefsForProduct(admin, session.shop, {
       productId,
       locales: requestedLocales,
-      briefs,
+      briefs: briefsWithPlans,
     });
   } catch (error) {
     return {
       error: error instanceof Error ? error.message : "Could not add briefs.",
     };
   }
+
+  // Remember the choice (mode + template or image, never the prompt) as the
+  // default for the next form. Best-effort.
+  try {
+    const memoryRaw = JSON.parse(String(formData.get("illustrationMemory") ?? "{}"));
+    if (typeof memoryRaw === "object" && memoryRaw !== null) {
+      await saveSettings(session.shop, {
+        illustrations: {
+          ...settings.illustrations,
+          lastFormChoice: {
+            ...settings.illustrations.lastFormChoice,
+            briefs: memoryRaw as Record<string, FormChoiceMemory>,
+          },
+        },
+      });
+    }
+  } catch {
+    // ignore
+  }
+
   // Briefs need no fetching step, so they go straight into the background
   // queue: the dashboard shows them as Queued and then live.
   await enqueueGeneration(session.shop, createdIds);
@@ -182,10 +289,11 @@ type BriefDraft = {
   tone: string;
   mustSay: string;
   mustAvoid: string;
+  illustrations: Record<string, IllustrationChoiceDraft>;
 };
 
 let draftCounter = 0;
-function newDraft(): BriefDraft {
+function newDraft(illustrations: Record<string, IllustrationChoiceDraft>): BriefDraft {
   draftCounter += 1;
   return {
     key: `brief-${draftCounter}`,
@@ -198,11 +306,12 @@ function newDraft(): BriefDraft {
     tone: "",
     mustSay: "",
     mustAvoid: "",
+    illustrations,
   };
 }
 
 export default function NewBriefs() {
-  const { locales, localesUnavailable } = useLoaderData<typeof loader>();
+  const { locales, localesUnavailable, illustration } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
   const submit = useSubmit();
@@ -211,13 +320,24 @@ export default function NewBriefs() {
   const defaultLocale =
     locales.find((l) => l.primary)?.locale ?? locales[0]?.locale ?? "en";
 
+  const initialIllustrations = useMemo(
+    () =>
+      Object.fromEntries(
+        illustration.surfaces.map((s) => [
+          s.key,
+          emptyChoice(illustration.lastChoice[s.key], illustration.templates, illustration.images),
+        ]),
+      ) as Record<string, IllustrationChoiceDraft>,
+    [illustration],
+  );
+
   const [product, setProduct] = useState<{ id: string; title: string } | null>(
     null,
   );
   const [selectedLocales, setSelectedLocales] = useState<string[]>([
     defaultLocale,
   ]);
-  const [briefs, setBriefs] = useState<BriefDraft[]>(() => [newDraft()]);
+  const [briefs, setBriefs] = useState<BriefDraft[]>(() => [newDraft(initialIllustrations)]);
   const [clientError, setClientError] = useState<string | null>(null);
 
   const isSubmitting = navigation.state === "submitting";
@@ -242,9 +362,31 @@ export default function NewBriefs() {
     [],
   );
 
+  const updateIllustration = useCallback(
+    (briefKey: string, surfaceKey: string, update: ChoiceUpdater) => {
+      setBriefs((prev) =>
+        prev.map((b) =>
+          b.key === briefKey
+            ? {
+                ...b,
+                illustrations: {
+                  ...b.illustrations,
+                  [surfaceKey]: update(
+                    b.illustrations[surfaceKey] ??
+                      emptyChoice(undefined, illustration.templates, illustration.images),
+                  ),
+                },
+              }
+            : b,
+        ),
+      );
+    },
+    [illustration.images, illustration.templates],
+  );
+
   const addBrief = useCallback(() => {
-    setBriefs((prev) => [...prev, newDraft()]);
-  }, []);
+    setBriefs((prev) => [...prev, newDraft(initialIllustrations)]);
+  }, [initialIllustrations]);
 
   const removeBrief = useCallback((key: string) => {
     setBriefs((prev) => (prev.length > 1 ? prev.filter((b) => b.key !== key) : prev));
@@ -274,6 +416,7 @@ export default function NewBriefs() {
       return;
     }
     setClientError(null);
+    const first = filledBriefs[0];
     submit(
       {
         productId: product.id,
@@ -290,7 +433,15 @@ export default function NewBriefs() {
               mustSay: b.mustSay,
               mustAvoid: b.mustAvoid,
             },
+            illustrations: Object.fromEntries(
+              Object.entries(b.illustrations).map(([k, d]) => [k, choiceToSubmission(d)]),
+            ),
           })),
+        ),
+        illustrationMemory: JSON.stringify(
+          Object.fromEntries(
+            Object.entries(first.illustrations).map(([k, d]) => [k, choiceToMemory(d)]),
+          ),
         ),
       },
       { method: "POST" },
@@ -487,6 +638,48 @@ export default function NewBriefs() {
                       />
                     </BlockStack>
                   </Collapsible>
+                  {illustration.surfaces.length > 0 && (
+                    <BlockStack gap="300">
+                      <Divider />
+                      <BlockStack gap="100">
+                        <Text as="h3" variant="headingSm">
+                          Illustrations
+                        </Text>
+                        <Text as="p" variant="bodySm" tone="subdued">
+                          Optional. Applies to every language of this brief
+                          (a drawn figure is drawn once per language, with its
+                          labels in that language). Everything can be changed
+                          later on each page's review screen.
+                        </Text>
+                      </BlockStack>
+                      {illustration.surfaces.map((s) => (
+                        <IllustrationChoice
+                          key={s.key}
+                          surfaceKey={s.key}
+                          surfaceLabel={s.label}
+                          value={
+                            brief.illustrations[s.key] ??
+                            emptyChoice(undefined, illustration.templates, illustration.images)
+                          }
+                          onChange={(update) => updateIllustration(brief.key, s.key, update)}
+                          templates={illustration.templates}
+                          images={illustration.images}
+                          locales={selectedLocales}
+                          recommend={(surfaceKey) =>
+                            requestRecommendations({
+                              surfaceKey,
+                              locale: selectedLocales[0] ?? defaultLocale,
+                              sourceKind: "brief",
+                              sourceText: composeBriefText(brief),
+                              productTitle: product?.title ?? "",
+                            })
+                          }
+                          openaiConfigured={illustration.openaiConfigured}
+                          costPerImage={illustration.costPerImage}
+                        />
+                      ))}
+                    </BlockStack>
+                  )}
                 </BlockStack>
               </Card>
             ))}

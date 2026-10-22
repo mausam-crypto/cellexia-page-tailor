@@ -220,9 +220,10 @@ and it may make claims the page never made. What remains in force:
   stored per section as **unverified claims** and shown on the review page.
   This is information for the reviewer, not a block.
 - The hard rules the brief cannot override: no drug-like language, no
-  attributes, images or links in the copy, the theme's interactive markup
-  preserved, never-touch selectors (price, reviews, structured data) enforced
-  at serve time exactly as for article variants.
+  attributes, images or links in the copy other than the app's own
+  illustration marker (see *Illustrations* below), the theme's interactive
+  markup preserved, never-touch selectors (price, reviews, structured data)
+  enforced at serve time exactly as for article variants.
 - The post-publication review model (next section) applies: a brief-based
   page, including any unverified claim on it, can serve to real visitors
   before anyone reads it. The links are private until an ad uses them, every
@@ -234,6 +235,41 @@ visitor, so nothing in the cloaking argument above moves. What moves is the
 substantiation posture — a brief-based page's claims are substantiated by the
 merchant's own brief and references, which the team must keep defensible, not
 by the product page or a published article.
+
+### Illustrations (added 2026-10-21)
+
+Brief- and article-based variants may carry one illustration per allowed
+surface (Science and Overview by default): an image from the merchant's
+library or one drawn by an image model from a template and a prompt, with a
+caption. What this changes, and what it does not:
+
+- **No model ever emits an image.** The copy-writing prompts still forbid
+  images and links. The sanitizer now works as an allowlist: an `<img>`
+  survives only when its address is one the theme region already contained,
+  or, at serve time, the app's own figure file. The figure's position is an
+  empty `<div data-pt-figure>` marker that the app inserts deterministically
+  after a small placement pass; the refine prompt is told to keep it in
+  place and a deterministic backstop re-inserts it if dropped.
+- **Served images are the shop's own files** (Shopify Files, `write_files`
+  scope), never third-party URLs, and the served `<img>` carries only
+  `src`, `alt`, `width`, `height`, `loading`. No tracking, no scripts.
+- **Same URL, same content.** The figure is part of the variant's stored
+  surface like the copy: deterministic per URL, same for every visitor, no
+  user-agent or referrer logic anywhere.
+- **Substantiation.** At the merchant's explicit direction, drawings may
+  contain words, labelled diagrams and charts, and a chart's numbers may be
+  illustrative rather than measured. The claim guard reads each figure's
+  caption, alt text and drawing prompt against the same sources as the
+  copy (article, or brief and references) and lists anything unsupported
+  under *Unverified claims*, marked "Illustration:", as information for the
+  reviewer. The post-publication review model applies: a drawn figure goes
+  live with the copy before anyone looks at it; every change is a version
+  with one-click restore, and the master serving switch remains the
+  emergency stop. Keeping illustrative data defensible is the team's
+  operational responsibility, as it is for brief-written claims.
+- **Never-touch elements** are unaffected: figures only ever render inside
+  the configured copy surfaces, which the selector rules already keep away
+  from price, reviews, structured data and metadata.
 
 Price, reviews, ratings, and structured data are never touched. This is
 enforced, not just promised: CSS selectors targeting price, review/rating,

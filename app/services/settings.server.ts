@@ -1,6 +1,11 @@
 import prisma from "../db.server";
 import type { CopySurface, ShopSettingsData } from "./types";
-import { DEFAULT_SUBTLE_SETTINGS, normalizeSubtleSettings } from "./types";
+import {
+  DEFAULT_ILLUSTRATION_SETTINGS,
+  DEFAULT_SUBTLE_SETTINGS,
+  normalizeIllustrationSettings,
+  normalizeSubtleSettings,
+} from "./types";
 
 export { unsafeSelectorReason } from "./selector-rules";
 
@@ -78,6 +83,7 @@ export async function getSettings(shop: string): Promise<ShopSettingsData> {
       subtle: DEFAULT_SUBTLE_SETTINGS,
       surfaces: DEFAULT_SURFACES,
       servingEnabled: false,
+      illustrations: DEFAULT_ILLUSTRATION_SETTINGS,
     };
   }
   let subtleRaw: unknown = {};
@@ -111,6 +117,7 @@ export async function getSettings(shop: string): Promise<ShopSettingsData> {
     subtle: normalizeSubtleSettings(subtleRaw),
     surfaces,
     servingEnabled: row.servingEnabled,
+    illustrations: normalizeIllustrationSettings(row.illustrationSettings),
   };
 }
 
@@ -125,6 +132,9 @@ export async function saveSettings(
     subtle: data.subtle ? normalizeSubtleSettings(data.subtle) : current.subtle,
     surfaces: data.surfaces ?? current.surfaces,
     servingEnabled: data.servingEnabled ?? current.servingEnabled,
+    illustrations: data.illustrations
+      ? normalizeIllustrationSettings(data.illustrations)
+      : current.illustrations,
   };
   const fields = {
     paramName: merged.paramName,
@@ -132,6 +142,7 @@ export async function saveSettings(
     subtleSettings: JSON.stringify(merged.subtle),
     surfaces: JSON.stringify(merged.surfaces),
     servingEnabled: merged.servingEnabled,
+    illustrationSettings: JSON.stringify(merged.illustrations),
   };
   await prisma.shopSettings.upsert({
     where: { shop },

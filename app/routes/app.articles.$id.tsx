@@ -22,19 +22,28 @@ import {
   List,
   Modal,
   Page,
+  Select,
   Text,
   TextField,
 } from "@shopify/polaris";
 import { useAppBridge } from "@shopify/app-bridge-react";
+import type { Override as OverrideRow } from "@prisma/client";
 import prisma from "../db.server";
 import { authenticate } from "../shopify.server";
 import { getSettings } from "../services/settings.server";
 import { refreshFindings } from "../services/generate.server";
 import {
   BRIEF_ADVANCED_FIELDS,
+  FIGURE_CLAIM_PREFIX,
+  illustrationsAllowed,
   normalizeAdaptationMode,
   normalizeBriefAdvanced,
+  normalizeSuggestions,
+  parseFigureAlternatives,
+  parseSurfaceFigureJob,
   type ConversionPlan,
+  type FigureAnchor,
+  type FigureSuggestion,
   type PersonaPriority,
   type ProofPoint,
   type SubtleInsertion,
@@ -48,6 +57,7 @@ import {
   getShopLocalesCached,
 } from "../services/shopify-data.server";
 import {
+  ILLUSTRATION_FAILED_PREFIX,
   REFINEMENT_FAILED_PREFIX,
   buildVariantUrl,
   duplicateArticle,
@@ -55,6 +65,32 @@ import {
   isQueuedFresh,
   sanitizeAdaptedHtml,
 } from "../services/variant.server";
+import {
+  describeBlocks,
+  hasMarker,
+  imageSrcsOf,
+  insertMarker,
+  locateMarker,
+  markerValueFor,
+  removeMarker,
+} from "../services/figure-markup";
+import { illustrationFormData } from "../services/illustrations.server";
+import {
+  imageModelConfigured,
+  typicalCostUsd,
+} from "../services/openai-images.server";
+import {
+  IllustrationChoice,
+  ImagePickerModal,
+  choiceToSubmission,
+  emptyChoice,
+  requestRecommendations,
+  thumbnailUrl,
+  type ChoiceImage,
+  type ChoiceTemplate,
+  type ChoiceUpdater,
+  type IllustrationChoiceDraft,
+} from "../components/IllustrationChoice";
 import {
   buildVersionCreate,
   prepareVersion,
@@ -273,7 +309,12 @@ async function applyOverrideEdits(
       }
       if (adaptedRaw !== null) {
         let adapted = String(adaptedRaw);
-        if (o.mode === "html") adapted = sanitizeAdaptedHtml(adapted);
+        if (o.mode === "html") {
+          // Theme images the region had may stay; a pasted <img> may not.
+          adapted = sanitizeAdaptedHtml(adapted, {
+            allowedImageSrcs: imageSrcsOf(o.original),
+          });
+        }
         const visibleText =
           o.mode === "html"
             ? adapted.replace(/<[^>]*>/g, "").trim()
@@ -328,6 +369,11 @@ async function applyOverrideEdits(
         data.articleClaims !== undefined ? data.articleClaims : o.articleClaims,
       unverifiedClaims: o.unverifiedClaims,
       enabled: data.enabled ?? o.enabled,
+      figureImageId: o.figureImageId,
+      figureCaption: o.figureCaption,
+      figureAlt: o.figureAlt,
+      figureAlternatives: o.figureAlternatives,
+      figureSource: o.figureSource,
     });
     if (data.adapted !== undefined || data.enabled !== undefined) {
       editedLabels.push(o.label);
@@ -355,6 +401,84 @@ async function applyOverrideEdits(
     await pruneVersions(article.id);
   }
   return { changed, findingsChanged, error: null };
+}
+
+/** Strip the figure's own claim-guard entries from a stored list. */
+function withoutFigureClaims(unverified: string | null): string | null {
+  const kept = parseJsonStringArray(unverified).filter(
+    (w) => !w.startsWith(FIGURE_CLAIM_PREFIX),
+  );
+  return kept.length > 0 ? JSON.stringify(kept) : null;
+}
+
+/**
+ * A synchronous figure edit (caption, alt, position, removal): rewrite the
+ * one surface, recreate every row (fresh ids, so the stale-copy guard trips
+ * for anyone else editing) and record an "edit" version.
+ */
+async function applyFigureEdit(
+  articleId: string,
+  surfaceKey: string,
+  patch: (o: OverrideRow) => Partial<OverrideRow>,
+  instruction: string,
+): Promise<{ error: string | null }> {
+  const overrides = await prisma.override.findMany({ where: { articleId } });
+  const target = overrides.find((o) => o.surfaceKey === surfaceKey);
+  if (!target) return { error: "That section is not part of this page." };
+  const nextRows = overrides.map((o) => {
+    const p = o.surfaceKey === surfaceKey ? patch(o) : {};
+    return {
+      surfaceKey: o.surfaceKey,
+      label: o.label,
+      selector: o.selector,
+      mode: o.mode,
+      original: o.original,
+      adapted: p.adapted ?? o.adapted,
+      notes: o.notes,
+      warnings: o.warnings,
+      articleClaims: o.articleClaims,
+      unverifiedClaims:
+        p.unverifiedClaims !== undefined ? p.unverifiedClaims : o.unverifiedClaims,
+      enabled: o.enabled,
+      figureImageId: p.figureImageId !== undefined ? p.figureImageId : o.figureImageId,
+      figureCaption: p.figureCaption !== undefined ? p.figureCaption : o.figureCaption,
+      figureAlt: p.figureAlt !== undefined ? p.figureAlt : o.figureAlt,
+      figureAlternatives:
+        p.figureAlternatives !== undefined ? p.figureAlternatives : o.figureAlternatives,
+      figureSource: p.figureSource !== undefined ? p.figureSource : o.figureSource,
+      figureError: o.surfaceKey === surfaceKey ? null : o.figureError,
+      figureLastJob: o.figureLastJob,
+    };
+  });
+  const { number, previousSnapshot } = await prepareVersion(articleId, overrides);
+  await prisma.$transaction([
+    prisma.override.deleteMany({ where: { articleId } }),
+    ...nextRows.map((row) => prisma.override.create({ data: { articleId, ...row } })),
+    buildVersionCreate({
+      articleId,
+      number,
+      kind: "edit",
+      instruction,
+      snapshot: nextRows,
+      previousSnapshot,
+    }),
+  ]);
+  await pruneVersions(articleId);
+  return { error: null };
+}
+
+/** Parse the position picker's value ("top", "bottom", "after:2", ...). */
+function parseAnchorValue(value: string): FigureAnchor | null {
+  if (value === "top" || value === "bottom") return { kind: value };
+  const m = /^(before|after):(\d+)$/.exec(value);
+  if (m) return { kind: m[1] as "before" | "after", index: Number(m[2]) };
+  return null;
+}
+
+function anchorValue(anchor: FigureAnchor | null, hasAnyMarker: boolean): string {
+  if (!anchor) return hasAnyMarker ? "custom" : "top";
+  if (anchor.kind === "top" || anchor.kind === "bottom") return anchor.kind;
+  return `${anchor.kind}:${anchor.index}`;
 }
 
 /**
@@ -402,7 +526,25 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   const [article, settings, versions] = await Promise.all([
     prisma.article.findFirst({
       where: { id: params.id, shop },
-      include: { overrides: { orderBy: { surfaceKey: "asc" } } },
+      include: {
+        overrides: {
+          orderBy: { surfaceKey: "asc" },
+          include: {
+            figureImage: {
+              select: {
+                id: true,
+                name: true,
+                cdnUrl: true,
+                width: true,
+                height: true,
+                templateId: true,
+                specificPrompt: true,
+                language: true,
+              },
+            },
+          },
+        },
+      },
     }),
     getSettings(shop),
     // Metadata only: snapshots are large and only Restore needs them.
@@ -426,6 +568,28 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
   }
   const refinementFailed =
     article.errorMessage?.startsWith(REFINEMENT_FAILED_PREFIX) ?? false;
+  const illustrationFailed =
+    article.errorMessage?.startsWith(ILLUSTRATION_FAILED_PREFIX) ?? false;
+
+  // Illustrations: the figure of every surface that allows one, with its
+  // alternatives, plus the library and templates for the figure panel.
+  const surfacesByKey = new Map(settings.surfaces.map((s) => [s.key, s]));
+  const alternativeIds = new Set<string>();
+  for (const o of article.overrides) {
+    for (const id of parseFigureAlternatives(o.figureAlternatives).images) {
+      alternativeIds.add(id);
+    }
+  }
+  const [alternativeImages, formData] = await Promise.all([
+    alternativeIds.size > 0
+      ? prisma.illustrationImage.findMany({
+          where: { id: { in: [...alternativeIds] }, shop },
+          select: { id: true, name: true, cdnUrl: true },
+        })
+      : Promise.resolve([]),
+    illustrationFormData(shop),
+  ]);
+  const alternativeById = new Map(alternativeImages.map((i) => [i.id, i]));
 
   // The page's core job (review + approve/unapprove, both local-DB actions)
   // must survive a flaky Admin API: degrade to locale codes and hide the
@@ -465,8 +629,12 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       status: article.status,
       errorMessage: refinementFailed
         ? (article.errorMessage ?? "").slice(REFINEMENT_FAILED_PREFIX.length)
-        : article.errorMessage,
+        : illustrationFailed
+          ? (article.errorMessage ?? "").slice(ILLUSTRATION_FAILED_PREFIX.length)
+          : article.errorMessage,
       refinementFailed,
+      illustrationFailed,
+      pendingFigureJob: article.pendingFigureJob !== null,
       sourceKind: article.sourceKind,
       briefName: article.briefName,
       briefText: article.briefText,
@@ -503,7 +671,47 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       warnings: parseJsonStringArray(o.warnings),
       articleClaims: parseJsonStringArray(o.articleClaims),
       unverifiedClaims: parseJsonStringArray(o.unverifiedClaims),
+      figure: (() => {
+        const surface = surfacesByKey.get(o.surfaceKey);
+        if (!surface || !illustrationsAllowed(surface)) return null;
+        const alternatives = parseFigureAlternatives(o.figureAlternatives);
+        return {
+          image: o.figureImage
+            ? {
+                id: o.figureImage.id,
+                name: o.figureImage.name,
+                url: o.figureImage.cdnUrl,
+                width: o.figureImage.width,
+                height: o.figureImage.height,
+                templateId: o.figureImage.templateId,
+                specificPrompt: o.figureImage.specificPrompt,
+                language: o.figureImage.language,
+              }
+            : null,
+          caption: o.figureCaption ?? "",
+          alt: o.figureAlt ?? "",
+          source: o.figureSource,
+          error: o.figureError,
+          canRetry: parseSurfaceFigureJob(o.figureLastJob) !== null,
+          anchor: locateMarker(o.adapted),
+          hasMarker: hasMarker(o.adapted),
+          blocks: describeBlocks(o.adapted),
+          alternatives: {
+            images: alternatives.images
+              .map((id) => alternativeById.get(id))
+              .filter((i): i is NonNullable<typeof i> => i !== undefined)
+              .map((i) => ({ id: i.id, name: i.name, url: i.cdnUrl })),
+            suggestions: alternatives.suggestions,
+          },
+        };
+      })(),
     })),
+    illustration: {
+      templates: formData.templates,
+      images: formData.images,
+      openaiConfigured: imageModelConfigured(),
+      costPerImage: typicalCostUsd(settings.illustrations.quality),
+    },
     versions: versions.map((v) => ({
       number: v.number,
       kind: v.kind,
@@ -634,8 +842,9 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     if (!Number.isInteger(number) || number < 1) {
       return { ok: false, intent, error: "Unknown version." };
     }
+    let notice: string | null = null;
     try {
-      await restoreVersion(shop, article.id, number);
+      notice = (await restoreVersion(shop, article.id, number)).notice;
     } catch (error) {
       return {
         ok: false,
@@ -643,7 +852,140 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         error: error instanceof Error ? error.message : "Could not restore that version.",
       };
     }
-    return { ok: true, intent, error: null, restored: number };
+    return { ok: true, intent, error: null, restored: number, notice };
+  }
+
+  // -------------------------------------------------------------------------
+  // Illustrations. Synchronous edits (caption, alt, position, remove) rewrite
+  // the rows here; anything that needs a model or the image API (pick from
+  // the library -> caption written by Claude; draw; retry) goes through the
+  // background queue as a figure job, like a refinement.
+  // -------------------------------------------------------------------------
+  if (
+    intent === "figureSave" ||
+    intent === "figureRemove" ||
+    intent === "figureUseImage" ||
+    intent === "figureDraw" ||
+    intent === "figureRetry"
+  ) {
+    if (isGenerationBusy(article)) {
+      return { ok: false, intent, error: GENERATING_ERROR };
+    }
+    if (!(await overridesMatchForm(article.id, formData))) {
+      return { ok: false, intent, error: STALE_COPY_ERROR };
+    }
+    const surfaceKey = String(formData.get("surfaceKey") ?? "");
+    const target = await prisma.override.findFirst({
+      where: { articleId: article.id, surfaceKey },
+    });
+    if (!target) {
+      return { ok: false, intent, error: "That section is not part of this page." };
+    }
+    const settings = await getSettings(shop);
+    const surface = settings.surfaces.find((s) => s.key === surfaceKey);
+    if (!surface || !illustrationsAllowed(surface)) {
+      return {
+        ok: false,
+        intent,
+        error: "Illustrations are switched off for this section in Settings.",
+      };
+    }
+
+    if (intent === "figureSave") {
+      if (!target.figureImageId) {
+        return { ok: false, intent, error: "This section has no illustration yet." };
+      }
+      const caption = String(formData.get("caption") ?? "").trim().slice(0, 300);
+      const alt = String(formData.get("alt") ?? "").trim().slice(0, 200);
+      const anchor = parseAnchorValue(String(formData.get("anchor") ?? "keep"));
+      const result = await applyFigureEdit(
+        article.id,
+        surfaceKey,
+        (o) => ({
+          figureCaption: caption || null,
+          figureAlt: alt || null,
+          ...(anchor
+            ? { adapted: insertMarker(o.adapted, anchor, markerValueFor(surfaceKey)) }
+            : {}),
+        }),
+        `Edited: ${target.label} illustration`,
+      );
+      if (result.error) return { ok: false, intent, error: result.error };
+      return { ok: true, intent, error: null, live: article.status === "approved" };
+    }
+
+    if (intent === "figureRemove") {
+      const result = await applyFigureEdit(
+        article.id,
+        surfaceKey,
+        (o) => ({
+          adapted: removeMarker(o.adapted),
+          figureImageId: null,
+          figureCaption: null,
+          figureAlt: null,
+          figureAlternatives: null,
+          figureSource: null,
+          unverifiedClaims: withoutFigureClaims(o.unverifiedClaims),
+        }),
+        `Removed: ${target.label} illustration`,
+      );
+      if (result.error) return { ok: false, intent, error: result.error };
+      return { ok: true, intent, error: null, live: article.status === "approved" };
+    }
+
+    if (intent === "figureUseImage") {
+      const imageId = String(formData.get("imageId") ?? "");
+      const image = await prisma.illustrationImage.findFirst({
+        where: { id: imageId, shop },
+        select: { id: true },
+      });
+      if (!image) return { ok: false, intent, error: "That image no longer exists." };
+      const { queued } = await enqueueGeneration(shop, [article.id], {
+        figureJob: {
+          surfaces: { [surfaceKey]: { mode: "library", imageId: image.id } },
+          resetReview: false,
+        },
+      });
+      if (queued === 0) return { ok: false, intent, error: "Already generating or queued." };
+      return { ok: true, intent, error: null };
+    }
+
+    if (intent === "figureDraw") {
+      let draws: FigureSuggestion[] = [];
+      try {
+        draws = normalizeSuggestions(JSON.parse(String(formData.get("draws") ?? "[]")));
+      } catch {
+        draws = [];
+      }
+      if (draws.length === 0) {
+        return { ok: false, intent, error: "Write a prompt or tick an idea to draw first." };
+      }
+      const templates = await prisma.illustrationTemplate.findMany({
+        where: { shop, id: { in: [...new Set(draws.map((d) => d.templateId))] } },
+        select: { id: true },
+      });
+      const known = new Set(templates.map((t) => t.id));
+      draws = draws.filter((d) => known.has(d.templateId));
+      if (draws.length === 0) {
+        return { ok: false, intent, error: "The chosen template no longer exists." };
+      }
+      const { queued } = await enqueueGeneration(shop, [article.id], {
+        figureJob: { surfaces: { [surfaceKey]: { mode: "draw", draws } }, resetReview: true },
+      });
+      if (queued === 0) return { ok: false, intent, error: "Already generating or queued." };
+      return { ok: true, intent, error: null };
+    }
+
+    // figureRetry
+    const lastJob = parseSurfaceFigureJob(target.figureLastJob);
+    if (!lastJob) {
+      return { ok: false, intent, error: "There is nothing to retry for this section." };
+    }
+    const { queued } = await enqueueGeneration(shop, [article.id], {
+      figureJob: { surfaces: { [surfaceKey]: lastJob }, resetReview: true },
+    });
+    if (queued === 0) return { ok: false, intent, error: "Already generating or queued." };
+    return { ok: true, intent, error: null };
   }
 
   if (intent === "duplicate") {
@@ -784,10 +1126,14 @@ function versionKindBadge(kind: string) {
       return <Badge tone="attention">Restored</Badge>;
     case "duplicate":
       return <Badge>Duplicated</Badge>;
+    case "figure":
+      return <Badge tone="magic">Illustrated</Badge>;
     default:
       return <Badge tone="success">Generated</Badge>;
   }
 }
+
+type FigureDraft = { caption: string; alt: string; anchor: string };
 
 const URL_LINE = /^https?:\/\/\S+$/i;
 
@@ -803,6 +1149,7 @@ export default function ArticleReview() {
     v2Plan,
     subtlePlan,
     overrides,
+    illustration,
     versions,
     variantUrl,
   } = useLoaderData<typeof loader>();
@@ -810,6 +1157,7 @@ export default function ArticleReview() {
   const submit = useSubmit();
   const generateFetcher = useFetcher<typeof action>();
   const saveFetcher = useFetcher<typeof action>();
+  const figureFetcher = useFetcher<typeof action>();
   const reviewFetcher = useFetcher<typeof action>();
   const modeFetcher = useFetcher<typeof action>();
   const refineFetcher = useFetcher<typeof action>();
@@ -845,6 +1193,7 @@ export default function ArticleReview() {
     refineFetcher.state !== "idle" ||
     article.generationInFlight ||
     article.queued;
+  const isFigureActing = figureFetcher.state !== "idle";
   const isRestoring = restoreFetcher.state !== "idle";
   const isReviewActing = reviewFetcher.state !== "idle";
   const overrideIds = overrides.map((o) => o.id).join(",");
@@ -888,6 +1237,55 @@ export default function ArticleReview() {
     setDrafts(makeDrafts());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [article.id, overridesKey]);
+
+  // Figure panel drafts (caption, alt, position), keyed like the copy drafts.
+  const makeFigureDrafts = useCallback(
+    () =>
+      Object.fromEntries(
+        overrides
+          .filter((o) => o.figure)
+          .map((o) => [
+            o.id,
+            {
+              caption: o.figure!.caption,
+              alt: o.figure!.alt,
+              anchor: anchorValue(o.figure!.anchor, o.figure!.hasMarker),
+            },
+          ]),
+      ) as Record<string, FigureDraft>,
+    [overrides],
+  );
+  const [figureDrafts, setFigureDrafts] = useState(makeFigureDrafts);
+  useEffect(() => {
+    setFigureDrafts(makeFigureDrafts());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [article.id, overridesKey]);
+  const updateFigureDraft = useCallback(
+    (id: string, patch: Partial<FigureDraft>) => {
+      setFigureDrafts((prev) => ({ ...prev, [id]: { ...prev[id], ...patch } }));
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (figureFetcher.state !== "idle" || !figureFetcher.data) return;
+    const data = figureFetcher.data;
+    if (!("intent" in data) || !String(data.intent).startsWith("figure")) return;
+    if (!data.ok && "error" in data && data.error) {
+      shopify.toast.show(String(data.error), { isError: true });
+      return;
+    }
+    const live = "live" in data ? Boolean(data.live) : false;
+    if (data.intent === "figureSave") {
+      shopify.toast.show(live ? "Illustration saved — live within ~2 minutes" : "Illustration saved");
+    } else if (data.intent === "figureRemove") {
+      shopify.toast.show(live ? "Illustration removed — live within ~2 minutes" : "Illustration removed");
+    } else if (data.intent === "figureUseImage") {
+      shopify.toast.show("Placing the illustration in the background — this page updates when it is done.");
+    } else {
+      shopify.toast.show("Drawing in the background — this page updates when it is done.");
+    }
+  }, [figureFetcher.state, figureFetcher.data, shopify]);
 
   useEffect(() => {
     if (saveFetcher.state === "idle" && saveFetcher.data?.intent === "save") {
@@ -982,11 +1380,14 @@ export default function ArticleReview() {
       } else {
         const restored =
           "restored" in restoreFetcher.data ? restoreFetcher.data.restored : null;
+        const notice =
+          "notice" in restoreFetcher.data ? restoreFetcher.data.notice : null;
         shopify.toast.show(
           restored
             ? `Version #${restored} restored — live on the storefront within ~2 minutes`
             : "Version restored",
         );
+        if (notice) shopify.toast.show(String(notice), { isError: true });
       }
     }
   }, [restoreFetcher.state, restoreFetcher.data, shopify]);
@@ -1049,6 +1450,19 @@ export default function ArticleReview() {
   const handleGenerate = useCallback(() => {
     generateFetcher.submit({ intent: "generate" }, { method: "POST" });
   }, [generateFetcher]);
+
+  const submitFigure = useCallback(
+    (fields: Record<string, string>) => {
+      figureFetcher.submit({ ...fields, overrideIds }, { method: "POST" });
+    },
+    [figureFetcher, overrideIds],
+  );
+
+  const recommendForSurface = useCallback(
+    (surfaceKey: string) =>
+      requestRecommendations({ surfaceKey, articleId: article.id }),
+    [article.id],
+  );
 
   const handleSave = useCallback(() => {
     // overrideIds lets the server reject a save against override rows that a
@@ -1192,7 +1606,9 @@ export default function ArticleReview() {
                   title={
                     article.pendingRefinement
                       ? "Queued for refinement"
-                      : "Queued for generation"
+                      : article.pendingFigureJob
+                        ? "Queued for illustration"
+                        : "Queued for generation"
                   }
                 >
                   {article.pendingRefinement
@@ -1200,6 +1616,14 @@ export default function ArticleReview() {
                     : "Starting momentarily."}{" "}
                   Runs in the background on the server - you can leave this
                   page; it updates automatically.
+                </Banner>
+              ) : article.pendingFigureJob ? (
+                <Banner tone="info" title="Illustrating — this takes a minute or two.">
+                  The image is drawn (or picked), placed in its section, and
+                  its caption written in the page&apos;s language, in the
+                  background on the server. The copy is live as it is; the
+                  figure appears when this finishes. You can leave this page;
+                  it updates automatically.
                 </Banner>
               ) : article.pendingRefinement ? (
                 <Banner tone="info" title="Refining — this takes a minute or two.">
@@ -1244,9 +1668,18 @@ export default function ArticleReview() {
                   was. Rephrase the instruction and try again.
                 </Banner>
               )}
+            {article.illustrationFailed &&
+              article.errorMessage &&
+              !isGenerating && (
+                <Banner tone="warning" title="Last illustration job failed">
+                  {article.errorMessage} — the copy was not touched. Try again
+                  from the section&apos;s illustration panel below.
+                </Banner>
+              )}
             {article.status === "approved" &&
               article.errorMessage &&
               !article.refinementFailed &&
+              !article.illustrationFailed &&
               !isGenerating && (
                 <Banner
                   tone="warning"
@@ -1993,10 +2426,12 @@ export default function ArticleReview() {
                             ))}
                           </List>
                           <Text as="p" variant="bodySm">
-                            The checker found these in neither the page copy,
-                            the brief, nor the references. Check each one
-                            before marking the page reviewed; edit or refine
-                            the copy if anything does not hold up.
+                            {isBrief
+                              ? "The checker found these in neither the page copy, the brief, nor the references. Check each one before marking the page reviewed; edit or refine the copy if anything does not hold up."
+                              : "The checker found these in neither the page copy nor the article. Check each one before marking the page reviewed."}
+                            {o.unverifiedClaims.some((c) => c.startsWith(FIGURE_CLAIM_PREFIX))
+                              ? ' Items marked "Illustration:" come from the figure\'s caption, alt text and drawing prompt; a chart may show illustrative numbers, which the checker lists here on purpose.'
+                              : ""}
                           </Text>
                         </BlockStack>
                       </Banner>
@@ -2058,6 +2493,32 @@ export default function ArticleReview() {
                       <Text as="p" tone="subdued" variant="bodySm">
                         Model notes: {o.notes}
                       </Text>
+                    )}
+                    {o.figure && (
+                      <FigurePanel
+                        overrideId={o.id}
+                        surfaceKey={o.surfaceKey}
+                        surfaceLabel={o.label}
+                        locale={article.locale}
+                        figure={o.figure}
+                        draft={
+                          figureDrafts[o.id] ?? {
+                            caption: o.figure.caption,
+                            alt: o.figure.alt,
+                            anchor: anchorValue(o.figure.anchor, o.figure.hasMarker),
+                          }
+                        }
+                        onDraft={(patch) => updateFigureDraft(o.id, patch)}
+                        busy={isGenerating || isFigureActing || isSaving}
+                        hasUnsavedEdits={hasUnsavedEdits}
+                        isLive={isLive}
+                        templates={illustration.templates}
+                        images={illustration.images}
+                        openaiConfigured={illustration.openaiConfigured}
+                        costPerImage={illustration.costPerImage}
+                        recommend={recommendForSurface}
+                        submitFigure={submitFigure}
+                      />
                     )}
                   </BlockStack>
                 </Card>
@@ -2153,10 +2614,11 @@ export default function ArticleReview() {
                     Version history
                   </Text>
                   <Text as="p" tone="subdued" variant="bodySm">
-                    Every generation, refinement, edit and restore is kept.
-                    Restoring replaces the live copy immediately (storefront
-                    within about 2 minutes) and keeps the current copy as a
-                    new version, so a restore can itself be undone.
+                    Every generation, refinement, edit, illustration and
+                    restore is kept. Restoring replaces the live copy (and
+                    its illustrations) immediately (storefront within about 2
+                    minutes) and keeps the current copy as a new version, so
+                    a restore can itself be undone.
                   </Text>
                   <BlockStack gap="200">
                     {versions.map((version, index) => (
@@ -2299,5 +2761,387 @@ export default function ArticleReview() {
         </Modal.Section>
       </Modal>
     </Page>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Illustration panel of one section
+// ---------------------------------------------------------------------------
+
+type FigureView = {
+  image: {
+    id: string;
+    name: string;
+    url: string;
+    width: number;
+    height: number;
+    templateId: string | null;
+    specificPrompt: string | null;
+    language: string | null;
+  } | null;
+  caption: string;
+  alt: string;
+  source: string | null;
+  error: string | null;
+  canRetry: boolean;
+  anchor: FigureAnchor | null;
+  hasMarker: boolean;
+  blocks: Array<{ index: number; tag: string; excerpt: string }>;
+  alternatives: {
+    images: Array<{ id: string; name: string; url: string }>;
+    suggestions: FigureSuggestion[];
+  };
+};
+
+function FigurePanel(props: {
+  overrideId: string;
+  surfaceKey: string;
+  surfaceLabel: string;
+  locale: string;
+  figure: FigureView;
+  draft: FigureDraft;
+  onDraft: (patch: Partial<FigureDraft>) => void;
+  busy: boolean;
+  hasUnsavedEdits: boolean;
+  isLive: boolean;
+  templates: ChoiceTemplate[];
+  images: ChoiceImage[];
+  openaiConfigured: boolean;
+  costPerImage: number;
+  recommend: (surfaceKey: string) => Promise<FigureSuggestion[]>;
+  submitFigure: (fields: Record<string, string>) => void;
+}) {
+  const { figure, draft, surfaceKey, templates, images } = props;
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [drawOpen, setDrawOpen] = useState(false);
+  const [drawChoice, setDrawChoice] = useState<IllustrationChoiceDraft>(() => ({
+    ...emptyChoice(undefined, templates, images),
+    mode: "template",
+  }));
+  const updateDrawChoice = useCallback(
+    (update: ChoiceUpdater) => setDrawChoice((prev) => update(prev)),
+    [],
+  );
+
+  const positionOptions = [
+    { label: "Top of the section", value: "top" },
+    ...figure.blocks.flatMap((b) => [
+      {
+        label: `After block ${b.index + 1} (${b.tag}: ${b.excerpt.slice(0, 50)}${
+          b.excerpt.length > 50 ? "…" : ""
+        })`,
+        value: `after:${b.index}`,
+      },
+    ]),
+    { label: "Bottom of the section", value: "bottom" },
+    ...(figure.hasMarker && !figure.anchor
+      ? [{ label: "Custom (placed by hand inside a block)", value: "custom" }]
+      : []),
+  ];
+
+  const figureChanged =
+    draft.caption !== figure.caption ||
+    draft.alt !== figure.alt ||
+    draft.anchor !== anchorValue(figure.anchor, figure.hasMarker);
+
+  // Rows are recreated by every figure job: unsaved copy edits would be lost.
+  const jobsBlocked = props.busy || props.hasUnsavedEdits;
+  const jobsHint = props.hasUnsavedEdits
+    ? "Save your copy edits first: drawing or picking an image replaces the rows and would discard unsaved typing."
+    : null;
+
+  const submitDrawChoice = useCallback(() => {
+    const submission = choiceToSubmission(drawChoice);
+    if (submission.mode === "library") {
+      props.submitFigure({ intent: "figureUseImage", surfaceKey, imageId: submission.imageId });
+      setDrawOpen(false);
+    } else if (submission.mode === "template") {
+      props.submitFigure({
+        intent: "figureDraw",
+        surfaceKey,
+        draws: JSON.stringify(submission.draws),
+      });
+      setDrawOpen(false);
+    }
+  }, [drawChoice, props, surfaceKey]);
+
+  const drawSubmission = choiceToSubmission(drawChoice);
+  const canSubmitDraw =
+    (drawSubmission.mode === "library" || drawSubmission.mode === "template") && !jobsBlocked;
+
+  return (
+    <Box borderColor="border" borderWidth="025" borderRadius="200" padding="300">
+      <BlockStack gap="300">
+        <InlineStack align="space-between" blockAlign="center" wrap>
+          <Text as="h3" variant="headingSm">
+            Illustration
+          </Text>
+          <InlineStack gap="200">
+            <Button size="slim" disabled={jobsBlocked} onClick={() => setPickerOpen(true)}>
+              Pick from library
+            </Button>
+            <Button size="slim" disabled={jobsBlocked} onClick={() => setDrawOpen(true)}>
+              {figure.image ? "Draw another" : "Draw one"}
+            </Button>
+            {figure.image?.templateId && figure.image.specificPrompt && (
+              <Button
+                size="slim"
+                disabled={jobsBlocked || !props.openaiConfigured}
+                onClick={() =>
+                  props.submitFigure({
+                    intent: "figureDraw",
+                    surfaceKey,
+                    draws: JSON.stringify([
+                      {
+                        templateId: figure.image!.templateId,
+                        specificPrompt: figure.image!.specificPrompt,
+                        rationale: "Drawn again",
+                      },
+                    ]),
+                  })
+                }
+              >
+                Draw again
+              </Button>
+            )}
+            {figure.image && (
+              <Button
+                size="slim"
+                tone="critical"
+                disabled={props.busy}
+                onClick={() => props.submitFigure({ intent: "figureRemove", surfaceKey })}
+              >
+                Remove
+              </Button>
+            )}
+          </InlineStack>
+        </InlineStack>
+        {jobsHint && (
+          <Text as="p" variant="bodySm" tone="caution">
+            {jobsHint}
+          </Text>
+        )}
+        {figure.error && (
+          <Banner
+            tone="warning"
+            title={figure.image ? "The last drawing had a problem" : "The illustration could not be made"}
+          >
+            <BlockStack gap="200">
+              <Text as="p">{figure.error}</Text>
+              {figure.canRetry && (
+                <InlineStack>
+                  <Button
+                    size="slim"
+                    disabled={jobsBlocked}
+                    onClick={() => props.submitFigure({ intent: "figureRetry", surfaceKey })}
+                  >
+                    Try again
+                  </Button>
+                </InlineStack>
+              )}
+            </BlockStack>
+          </Banner>
+        )}
+        {figure.image ? (
+          <InlineGrid columns={{ xs: 1, md: ["oneThird", "twoThirds"] }} gap="400">
+            <BlockStack gap="150">
+              <img
+                src={thumbnailUrl(figure.image.url, 800)}
+                alt={figure.alt}
+                style={{ width: "100%", height: "auto", borderRadius: 6, display: "block" }}
+              />
+              <InlineStack gap="100" wrap>
+                <Badge tone={figure.source === "library" ? undefined : "info"}>
+                  {figure.source === "library"
+                    ? "Library image"
+                    : figure.source === "auto"
+                      ? "Drawn (Auto)"
+                      : "Drawn"}
+                </Badge>
+                {figure.image.language && figure.image.language !== props.locale && (
+                  <Badge tone="attention">{`Labels in ${figure.image.language}`}</Badge>
+                )}
+              </InlineStack>
+              <Text as="span" variant="bodySm" tone="subdued">
+                {figure.image.name}
+              </Text>
+            </BlockStack>
+            <BlockStack gap="300">
+              <TextField
+                label="Caption (shown under the image)"
+                value={draft.caption}
+                onChange={(caption) => props.onDraft({ caption })}
+                multiline={2}
+                autoComplete="off"
+                maxLength={300}
+              />
+              <TextField
+                label="Alt text (for screen readers)"
+                value={draft.alt}
+                onChange={(alt) => props.onDraft({ alt })}
+                autoComplete="off"
+                maxLength={200}
+              />
+              <Select
+                label="Position in the section"
+                options={positionOptions}
+                value={draft.anchor}
+                onChange={(anchor) => props.onDraft({ anchor })}
+                helpText={
+                  !figure.hasMarker
+                    ? "The figure's marker is missing from the adapted copy (removed by hand): it renders at the top until you save a position."
+                    : undefined
+                }
+              />
+              <InlineStack align="end" gap="300" blockAlign="center">
+                {props.isLive && figureChanged && (
+                  <Text as="span" variant="bodySm" tone="subdued">
+                    Live within about 2 minutes after saving.
+                  </Text>
+                )}
+                <Button
+                  size="slim"
+                  variant="primary"
+                  disabled={props.busy || !figureChanged}
+                  onClick={() =>
+                    props.submitFigure({
+                      intent: "figureSave",
+                      surfaceKey,
+                      caption: draft.caption,
+                      alt: draft.alt,
+                      anchor: draft.anchor === "custom" ? "keep" : draft.anchor,
+                    })
+                  }
+                >
+                  Save illustration
+                </Button>
+              </InlineStack>
+            </BlockStack>
+          </InlineGrid>
+        ) : (
+          <Text as="p" variant="bodySm" tone="subdued">
+            No illustration in this section. Pick one from the library or draw
+            one; Claude places it and writes the caption in the page&apos;s
+            language.
+          </Text>
+        )}
+        {(figure.alternatives.images.length > 0 || figure.alternatives.suggestions.length > 0) && (
+          <BlockStack gap="200">
+            <Text as="h4" variant="headingXs">
+              Alternatives
+            </Text>
+            {figure.alternatives.images.length > 0 && (
+              <InlineGrid columns={{ xs: 2, md: 4 }} gap="300">
+                {figure.alternatives.images.map((alt) => (
+                  <BlockStack key={alt.id} gap="100">
+                    <img
+                      src={thumbnailUrl(alt.url, 400)}
+                      alt=""
+                      style={{ width: "100%", height: "auto", borderRadius: 6, display: "block" }}
+                    />
+                    <Button
+                      size="slim"
+                      disabled={jobsBlocked}
+                      onClick={() =>
+                        props.submitFigure({ intent: "figureUseImage", surfaceKey, imageId: alt.id })
+                      }
+                    >
+                      Use this
+                    </Button>
+                  </BlockStack>
+                ))}
+              </InlineGrid>
+            )}
+            {figure.alternatives.suggestions.map((s, i) => (
+              <Box
+                key={`${s.templateId}-${i}`}
+                background="bg-surface-secondary"
+                borderRadius="200"
+                padding="200"
+              >
+                <InlineStack align="space-between" blockAlign="start" gap="300" wrap={false}>
+                  <BlockStack gap="050">
+                    <Text as="span" variant="bodySm" fontWeight="semibold">
+                      {templates.find((t) => t.id === s.templateId)?.name ?? "Template"}
+                    </Text>
+                    <Text as="span" variant="bodySm">
+                      {s.specificPrompt}
+                    </Text>
+                    {s.rationale && (
+                      <Text as="span" variant="bodySm" tone="subdued">
+                        {s.rationale}
+                      </Text>
+                    )}
+                  </BlockStack>
+                  <Button
+                    size="slim"
+                    disabled={jobsBlocked || !props.openaiConfigured}
+                    onClick={() =>
+                      props.submitFigure({
+                        intent: "figureDraw",
+                        surfaceKey,
+                        draws: JSON.stringify([s]),
+                      })
+                    }
+                  >
+                    Draw this
+                  </Button>
+                </InlineStack>
+              </Box>
+            ))}
+          </BlockStack>
+        )}
+      </BlockStack>
+      <ImagePickerModal
+        open={pickerOpen}
+        images={images}
+        onPick={(image) => {
+          setPickerOpen(false);
+          props.submitFigure({ intent: "figureUseImage", surfaceKey, imageId: image.id });
+        }}
+        onClose={() => setPickerOpen(false)}
+      />
+      <Modal
+        open={drawOpen}
+        onClose={() => setDrawOpen(false)}
+        title={`Illustrate: ${props.surfaceLabel}`}
+        size="large"
+        primaryAction={{
+          content:
+            drawSubmission.mode === "library"
+              ? "Use this image"
+              : drawSubmission.mode === "template"
+                ? `Draw ${drawSubmission.draws.length === 1 ? "it" : `${drawSubmission.draws.length} images`}`
+                : "Draw",
+          disabled: !canSubmitDraw,
+          onAction: submitDrawChoice,
+        }}
+        secondaryActions={[{ content: "Cancel", onAction: () => setDrawOpen(false) }]}
+      >
+        <Modal.Section>
+          <BlockStack gap="300">
+            <Text as="p" variant="bodySm" tone="subdued">
+              Recommend reads this page&apos;s source (the brief or the
+              article) and the section&apos;s current copy. The first drawn
+              image goes live in this section (review needed); the others are
+              kept as alternatives.
+            </Text>
+            <IllustrationChoice
+              surfaceKey={surfaceKey}
+              surfaceLabel={props.surfaceLabel}
+              value={drawChoice}
+              onChange={updateDrawChoice}
+              templates={templates}
+              images={images}
+              locales={[props.locale]}
+              recommend={props.recommend}
+              openaiConfigured={props.openaiConfigured}
+              costPerImage={props.costPerImage}
+              hideAuto
+            />
+          </BlockStack>
+        </Modal.Section>
+      </Modal>
+    </Box>
   );
 }

@@ -41,10 +41,14 @@ answers for real storefront traffic of the installed shop.
 | `read_translations` | Localized copy managed by Translate & Adapt (Translations API) |
 | `read_locales` | Published shop locales, used to localize base copy and build variant URLs |
 | `read_orders` | Experiment tracker only — syncs order totals for the baseline/treatment windows |
+| `write_files` | Illustrations only — uploaded and drawn images are stored in the store's Files (Shopify CDN) and deleted from there when removed from the library |
 
-No write scopes: the app never modifies products, metafields, orders, or
-translations. Variants live only in the app database. Shops that installed
-before `read_orders` was added are prompted to re-consent to the new scope.
+The app never modifies products, metafields, orders, or translations; the
+only thing it writes to the store is image files. Variants live only in the
+app database. Shops that installed before a scope was added (`read_orders`,
+`write_files`) are prompted to approve it the next time they open the app;
+until then the Image library shows a permission banner and drawings fail with
+that message.
 
 ### Database
 
@@ -237,6 +241,14 @@ Honestly:
 | Experiment shows no views | App embed not enabled, or enabled after the baseline window began | Enable the embed; views only accrue from that moment — for baseline coverage, enable it at least one full window before creating the experiment |
 | Conversion rate says "not enough data" | Missing view coverage for one window, or under 200 views per window | Ensure the embed was on for the whole baseline; otherwise wait for more traffic — other metrics still report |
 | Order backfill truncated | Very high volume store — more than 5000 orders in the sync window | The report is based on partial order data; use a shorter baseline window |
+| "The app needs the Files permission (write_files)" | The shop has not approved the scope added with illustrations | Open the app from the Shopify admin and accept the updated permissions, then *Try again* |
+| "OPENAI_API_KEY is not set" / "missing or invalid" | Drawing needs an OpenAI key on the server | Add it to `.env` (or the host's env) and restart; the library and uploads work without it |
+| "Your OpenAI organization must complete verification" | OpenAI requires verification for GPT Image models | Verify the organization on platform.openai.com, then *Try again* |
+| "The image model declined this prompt" | OpenAI's moderation refused the drawing | Reword the specific prompt (avoid treatment wording, real people), draw again |
+| "The monthly illustration budget … is reached" | Settings cap hit | Raise or clear the budget in Settings, or wait for next month; library images still work |
+| Figure missing on the storefront | Illustrations switched off for that surface, or the page's copy was restored to a pre-figure version | Tick *Allow illustrations* in Settings; check the figure panel on the review page |
+| Figure sits at the top instead of where it was placed | The `<div data-pt-figure>` marker was removed by a hand edit | Set the position in the figure panel and *Save illustration* (this re-inserts the marker) |
+| "Shopify is still processing the image" | Shopify had not finished processing the upload within a minute | *Try again* in a minute |
 
 ## 7. Briefs, refinements and version history
 
@@ -276,3 +288,73 @@ first time anything changes them. The last 50 versions are kept per variant.
 
 **Duplicate** (every variant) creates a new variant with a fresh URL carrying
 the same brief, copy, review state and history; the original is untouched.
+
+## 8. Illustrations
+
+Illustrations are figures (an image plus a caption) served inside an adapted
+HTML surface: by default the Science and Overview tabs, and any other HTML
+surface whose *Allow illustrations* switch is ticked in Settings. The
+storefront embed needs no extra setting: the figure is part of the swapped
+HTML (`<figure class="pt-figure">`, full width, lazy-loaded, with minimal
+styling from the embed; the theme's typography applies to the caption).
+
+**Where images live.** In the store's Files (Shopify CDN), under the
+`write_files` scope. The app's Image library holds the coordinates, the
+description, tags, the language of any labels inside the image and, for
+drawn images, the template, the full prompt, the model, the quality and the
+exact cost. Deleting an image removes it from Files too; an image used on a
+page (as the live figure or an alternative) or as a template example cannot
+be deleted until it is removed there.
+
+**Templates** are reusable drawing styles: a category and a "when to use"
+note (what the recommender reads), drawing instructions (sent to the image
+model in front of the specific prompt), a preferred shape (landscape 3:2,
+square, portrait 2:3) and an optional example image. Eight starters are
+seeded once per shop; they can be edited, reset to the starter text, and
+archived (not deleted). A shop-wide **house style** text in Settings is
+added in front of every template.
+
+**Drawing** uses OpenAI's image model (`OPENAI_API_KEY`; model
+`OPENAI_IMAGE_MODEL`, default `gpt-image-2.5-sunburst`) at the quality set in
+Settings (default High, about $0.05 per landscape image; Low and Medium are
+cheaper but render labels less reliably). The full prompt is: house style +
+template instructions + the specific prompt + "every label is written in
+<the page's language>". One image is drawn per language page. Words,
+labelled diagrams and charts are allowed inside the image; a chart's numbers
+come from the specific prompt and may be illustrative (the claim guard lists
+them under *Unverified claims* as information).
+
+**Recommend** (creation forms and the review page's *Draw* dialog) asks
+Claude for five template + prompt ideas from the brief or the article (and,
+on the review page, the section's current copy). Tick the ideas to draw; the
+first goes live, the others are kept as alternatives. In *Add articles* the
+form's Recommend reads the first URL only; *Auto* reads each article at
+generation time.
+
+**Placement and caption.** After the copy is written, Claude chooses where
+the figure sits among the section's blocks (top, after a given block,
+bottom) and writes a caption (under the image) and an alt text (for screen
+readers) in the page's language. The position is a `<div data-pt-figure>`
+marker inside the adapted HTML; the review page's figure panel moves it
+(*Position* + *Save illustration*). A hand edit that deletes the marker
+makes the figure render at the top until a position is saved again.
+
+**What goes live when.** The copy goes live first (as before); the figure
+follows one to three minutes later, flagged for review. Drawing or picking
+from the review page runs in the same background queue as refinements; the
+page shows "Illustrating…" and updates itself. A failed drawing never
+touches the copy: the section shows the reason and a *Try again* button.
+
+**Refine / Start over / Restore / Duplicate.** Refine keeps the figure
+(and may move it when the instruction asks; captions are edited in the
+figure panel, not by Refine). Start over keeps the illustration and
+re-places it in the new copy with a fresh caption, drawing nothing. Every
+figure change is a version; Restore brings a version's figures back (an
+illustration whose image was deleted from the library is dropped with a
+notice). Duplicate copies the figures (same library images).
+
+**Budget.** Settings → *Monthly drawing budget*: when the month's spend (sum
+of every drawing's recorded cost, UTC month) reaches it, drawing pauses with
+a clear message; copy generation and library images are unaffected. The
+budget is checked before each drawing, so a batch can overshoot by the
+drawings already in flight.

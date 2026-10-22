@@ -1,5 +1,6 @@
 import prisma from "../db.server";
 import { unauthenticated } from "../shopify.server";
+import type { FigureJob } from "./types";
 import {
   GENERATION_LOCK_STALE_MS,
   generateForArticle,
@@ -76,13 +77,18 @@ function ensureWorker(): void {
 export async function enqueueGeneration(
   shop: string,
   articleIds: string[],
-  options: { refinement?: string } = {},
+  options: { refinement?: string; figureJob?: FigureJob | null } = {},
 ): Promise<{ queued: number; skipped: number }> {
   ensureWorker();
   const s = state();
   let queued = 0;
   let skipped = 0;
   const pendingRefinement = options.refinement?.trim() || null;
+  // A figure job (draw or place an illustration, copy untouched) is written
+  // the same explicit way: a stale value can never be mis-applied.
+  const pendingFigureJob = options.figureJob
+    ? JSON.stringify(options.figureJob)
+    : null;
   for (const id of articleIds) {
     if (s.inFlight.has(id)) {
       skipped++;
@@ -98,7 +104,12 @@ export async function enqueueGeneration(
           { generatingAt: { lt: lockStaleCutoff() } },
         ],
       },
-      data: { queuedAt: new Date(), errorMessage: null, pendingRefinement },
+      data: {
+        queuedAt: new Date(),
+        errorMessage: null,
+        pendingRefinement,
+        pendingFigureJob,
+      },
     });
     if (result.count === 1) queued++;
     else skipped++;
@@ -200,13 +211,18 @@ async function runOne(articleId: string, shop: string): Promise<void> {
     await prisma.article
       .updateMany({
         where: { id: articleId, status: { not: "approved" } },
-        data: { status: "error", errorMessage: message, pendingRefinement: null },
+        data: {
+          status: "error",
+          errorMessage: message,
+          pendingRefinement: null,
+          pendingFigureJob: null,
+        },
       })
       .catch(() => {});
     await prisma.article
       .updateMany({
         where: { id: articleId, status: "approved" },
-        data: { errorMessage: message, pendingRefinement: null },
+        data: { errorMessage: message, pendingRefinement: null, pendingFigureJob: null },
       })
       .catch(() => {});
   }

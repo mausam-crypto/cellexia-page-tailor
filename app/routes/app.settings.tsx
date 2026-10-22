@@ -37,8 +37,22 @@ import {
   getProductMetafieldDefinitionsCached,
   type MetafieldDefinitionSummary,
 } from "../services/shopify-data.server";
-import type { CopySurface, SubtleModeSettings } from "../services/types";
-import { normalizeSubtleSettings } from "../services/types";
+import type {
+  CopySurface,
+  IllustrationQuality,
+  SubtleModeSettings,
+} from "../services/types";
+import {
+  illustrationsAllowed,
+  normalizeIllustrationQuality,
+  normalizeSubtleSettings,
+} from "../services/types";
+import { monthSpend } from "../services/illustrations.server";
+import {
+  imageModel,
+  imageModelConfigured,
+  typicalCostUsd,
+} from "../services/openai-images.server";
 
 const PARAM_NAME_RE = /^[a-z0-9_]{1,12}$/;
 
@@ -69,11 +83,12 @@ function defaultModeForType(type: string): "text" | "html" {
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
-  const [settings, approvedCount] = await Promise.all([
+  const [settings, approvedCount, spentThisMonth] = await Promise.all([
     getSettings(session.shop),
     prisma.article.count({
       where: { shop: session.shop, status: "approved" },
     }),
+    monthSpend(session.shop).catch(() => 0),
   ]);
   // Metafield definitions come from the Admin API; if it hiccups, still show
   // the page (description surface + previously saved metafield surfaces).
@@ -139,6 +154,20 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     approvedCount,
     metafieldsUnavailable,
     rows,
+    illustrations: {
+      quality: settings.illustrations.quality,
+      monthlyCapUsd: settings.illustrations.monthlyCapUsd,
+      houseStyle: settings.illustrations.houseStyle,
+    },
+    spentThisMonth,
+    openaiConfigured: imageModelConfigured(),
+    imageModelName: imageModel(),
+    costByQuality: {
+      low: typicalCostUsd("low"),
+      medium: typicalCostUsd("medium"),
+      high: typicalCostUsd("high"),
+      xhigh: typicalCostUsd("xhigh"),
+    },
   };
 };
 
@@ -191,9 +220,40 @@ export const action = async ({ request }: ActionFunctionArgs) => {
           r.depth === "light" || r.depth === "medium" || r.depth === "deep"
             ? (r.depth as "light" | "medium" | "deep")
             : undefined,
+        illustrations:
+          r.illustrations === true || r.illustrations === "true"
+            ? true
+            : r.illustrations === false || r.illustrations === "false"
+              ? false
+              : undefined,
       };
     })
     .filter((s) => s.key);
+
+  // Illustration settings: the form sends the three editable fields; the
+  // remembered creation-form choices stay as they are.
+  let illustrationsParsed: Record<string, unknown> = {};
+  try {
+    const raw = JSON.parse(String(formData.get("illustrations") ?? "{}"));
+    if (typeof raw === "object" && raw !== null) illustrationsParsed = raw;
+  } catch {
+    illustrationsParsed = {};
+  }
+  const capRaw = String(illustrationsParsed.monthlyCapUsd ?? "").trim();
+  const capNumber = capRaw === "" ? null : Number(capRaw);
+  if (capNumber !== null && (!Number.isFinite(capNumber) || capNumber < 0)) {
+    return {
+      ok: false as const,
+      error: "The monthly illustration budget must be a number of dollars, or empty for no cap.",
+    };
+  }
+  const current = await getSettings(session.shop);
+  const illustrations = {
+    ...current.illustrations,
+    quality: normalizeIllustrationQuality(illustrationsParsed.quality),
+    monthlyCapUsd: capNumber && capNumber > 0 ? capNumber : null,
+    houseStyle: String(illustrationsParsed.houseStyle ?? "").trim().slice(0, 4000),
+  };
 
   // Validate the parameter name instead of silently rewriting it — a value
   // that differs from what the merchant typed would desync from the theme
@@ -248,6 +308,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     subtle,
     surfaces,
     servingEnabled,
+    illustrations,
   });
   return { ok: true as const, savedAt: Date.now() };
 };
@@ -283,6 +344,15 @@ export default function Settings() {
     loaderData.servingEnabled,
   );
   const [rows, setRows] = useState<CopySurface[]>(loaderData.rows);
+  const [quality, setQuality] = useState<IllustrationQuality>(
+    loaderData.illustrations.quality,
+  );
+  const [monthlyCap, setMonthlyCap] = useState(
+    loaderData.illustrations.monthlyCapUsd === null
+      ? ""
+      : String(loaderData.illustrations.monthlyCapUsd),
+  );
+  const [houseStyle, setHouseStyle] = useState(loaderData.illustrations.houseStyle);
 
   const isSaving = navigation.state === "submitting";
 
@@ -311,10 +381,27 @@ export default function Settings() {
         subtle: JSON.stringify(subtle),
         servingEnabled: String(servingEnabled),
         surfaces: JSON.stringify(rows),
+        illustrations: JSON.stringify({
+          quality,
+          monthlyCapUsd: monthlyCap,
+          houseStyle,
+        }),
       },
       { method: "POST" },
     );
-  }, [paramName, intensity, subtle, servingEnabled, rows, submit]);
+  }, [
+    paramName,
+    intensity,
+    subtle,
+    servingEnabled,
+    rows,
+    quality,
+    monthlyCap,
+    houseStyle,
+    submit,
+  ]);
+
+  const money = (n: number) => `$${n.toFixed(n < 0.1 ? 3 : 2)}`;
 
   return (
     <Page
@@ -542,6 +629,61 @@ export default function Settings() {
               <BlockStack gap="400">
                 <BlockStack gap="200">
                   <Text as="h2" variant="headingMd">
+                    Illustrations
+                  </Text>
+                  <Text as="p" variant="bodyMd" tone="subdued">
+                    AI-drawn figures for the sections that allow illustrations
+                    (tick "Allow illustrations" on a surface below; Science and
+                    Overview allow them by default). Images are stored in your
+                    store's Files. Drawing uses OpenAI's image model
+                    ({loaderData.imageModelName});{" "}
+                    {loaderData.openaiConfigured
+                      ? "the OPENAI_API_KEY is set on the server."
+                      : "OPENAI_API_KEY is not set on the server, so drawing is unavailable until it is (the library and uploads still work)."}
+                  </Text>
+                </BlockStack>
+                <InlineGrid columns={{ xs: 1, md: 2 }} gap="300">
+                  <Select
+                    label="Drawing quality"
+                    options={[
+                      { label: `Low — about ${money(loaderData.costByQuality.low)} per image`, value: "low" },
+                      { label: `Medium — about ${money(loaderData.costByQuality.medium)} per image`, value: "medium" },
+                      { label: `High — about ${money(loaderData.costByQuality.high)} per image (recommended)`, value: "high" },
+                      { label: `Extra high — about ${money(loaderData.costByQuality.xhigh)} per image`, value: "xhigh" },
+                    ]}
+                    value={quality}
+                    onChange={(value) => setQuality(normalizeIllustrationQuality(value))}
+                    helpText="Higher tiers follow the prompt more closely and render labels more reliably. Figures with text or data need High or above. Prices are estimates for a landscape image; the exact cost of every drawing is recorded in the image library."
+                  />
+                  <TextField
+                    label="Monthly drawing budget (USD)"
+                    type="number"
+                    value={monthlyCap}
+                    onChange={setMonthlyCap}
+                    autoComplete="off"
+                    placeholder="No cap"
+                    min={0}
+                    step={1}
+                    helpText={`Spent this month: ${money(loaderData.spentThisMonth)}. When the month's spend reaches the cap, drawing pauses (copy still generates; library images still work) until next month or a higher cap.`}
+                  />
+                </InlineGrid>
+                <TextField
+                  label="House style (optional)"
+                  value={houseStyle}
+                  onChange={setHouseStyle}
+                  multiline={3}
+                  autoComplete="off"
+                  placeholder="e.g. Brand colours: deep teal #0F6E6E for accents, warm grey text. Always a plain white background."
+                  helpText="Added to the start of every drawing prompt, before the template's instructions. Keep it to style: colours, line weight, mood. Each template already describes a clean clinical style."
+                  maxLength={4000}
+                />
+              </BlockStack>
+            </Card>
+
+            <Card>
+              <BlockStack gap="400">
+                <BlockStack gap="200">
+                  <Text as="h2" variant="headingMd">
                     Copy surfaces
                   </Text>
                   <Text as="p" variant="bodyMd" tone="subdued">
@@ -582,13 +724,24 @@ export default function Settings() {
                                 : `Metafield ${row.namespace}.${row.metafieldKey}`}
                           </Text>
                         </BlockStack>
-                        <Checkbox
-                          label="Adapt this surface"
-                          checked={row.enabled}
-                          onChange={(value) =>
-                            updateRow(row.key, { enabled: value })
-                          }
-                        />
+                        <InlineStack gap="400" blockAlign="center" wrap>
+                          <Checkbox
+                            label="Adapt this surface"
+                            checked={row.enabled}
+                            onChange={(value) =>
+                              updateRow(row.key, { enabled: value })
+                            }
+                          />
+                          {row.mode === "html" && (
+                            <Checkbox
+                              label="Allow illustrations"
+                              checked={illustrationsAllowed(row)}
+                              onChange={(value) =>
+                                updateRow(row.key, { illustrations: value })
+                              }
+                            />
+                          )}
+                        </InlineStack>
                       </InlineStack>
                       <InlineGrid columns={{ xs: 1, md: 4 }} gap="300">
                         <TextField

@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import { redirect } from "@remix-run/node";
 import {
@@ -27,9 +27,40 @@ import {
   getShopLocalesCached,
 } from "../services/shopify-data.server";
 import { createArticlesForProduct } from "../services/variant.server";
+import { getSettings, saveSettings } from "../services/settings.server";
+import {
+  illustrationFormData,
+  sanitizeIllustrationPlan,
+} from "../services/illustrations.server";
+import {
+  imageModelConfigured,
+  typicalCostUsd,
+} from "../services/openai-images.server";
+import { illustrationsAllowed, type FormChoiceMemory } from "../services/types";
+import {
+  IllustrationChoice,
+  choiceToMemory,
+  choiceToSubmission,
+  emptyChoice,
+  requestRecommendations,
+  type ChoiceUpdater,
+  type IllustrationChoiceDraft,
+} from "../components/IllustrationChoice";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
+  const settings = await getSettings(session.shop);
+  const { templates, images } = await illustrationFormData(session.shop);
+  const illustration = {
+    surfaces: settings.surfaces
+      .filter((s) => s.enabled && s.selector.trim() !== "" && illustrationsAllowed(s))
+      .map((s) => ({ key: s.key, label: s.label })),
+    templates,
+    images,
+    lastChoice: settings.illustrations.lastFormChoice.articles,
+    openaiConfigured: imageModelConfigured(),
+    costPerImage: typicalCostUsd(settings.illustrations.quality),
+  };
   // A transient Admin API failure must degrade to an explanatory banner,
   // not replace the whole page with an error boundary. Cached: after the
   // first load this answers without a Shopify round trip (the action below
@@ -38,9 +69,9 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     const locales = (
       await getShopLocalesCached(admin, session.shop)
     ).filter((l) => l.published);
-    return { locales, localesUnavailable: false };
+    return { locales, localesUnavailable: false, illustration };
   } catch {
-    return { locales: [], localesUnavailable: true };
+    return { locales: [], localesUnavailable: true, illustration };
   }
 };
 
@@ -86,6 +117,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     };
   }
 
+  // Illustration choices for the whole batch, validated against the shop.
+  const settings = await getSettings(session.shop);
+  const allowedKeys = settings.surfaces
+    .filter((s) => s.enabled && illustrationsAllowed(s))
+    .map((s) => s.key);
+  const plan = await sanitizeIllustrationPlan(
+    session.shop,
+    String(formData.get("illustrations") ?? "{}"),
+    allowedKeys,
+  );
+
   try {
     await createArticlesForProduct(admin, session.shop, {
       productId,
@@ -94,17 +136,37 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       pastedTitle,
       pastedText,
       mode,
+      illustrationPlan: Object.keys(plan).length > 0 ? JSON.stringify(plan) : null,
     });
   } catch (error) {
     return {
       error: error instanceof Error ? error.message : "Could not add articles.",
     };
   }
+
+  // Remember the choice (mode + template or image, never the prompt) as the
+  // default for the next form. Best-effort.
+  try {
+    const memoryRaw = JSON.parse(String(formData.get("illustrationMemory") ?? "{}"));
+    if (typeof memoryRaw === "object" && memoryRaw !== null) {
+      await saveSettings(session.shop, {
+        illustrations: {
+          ...settings.illustrations,
+          lastFormChoice: {
+            ...settings.illustrations.lastFormChoice,
+            articles: memoryRaw as Record<string, FormChoiceMemory>,
+          },
+        },
+      });
+    }
+  } catch {
+    // ignore
+  }
   return redirect("/app");
 };
 
 export default function NewArticles() {
-  const { locales, localesUnavailable } = useLoaderData<typeof loader>();
+  const { locales, localesUnavailable, illustration } = useLoaderData<typeof loader>();
   const actionData = useActionData<typeof action>();
   const navigation = useNavigation();
   const submit = useSubmit();
@@ -112,6 +174,17 @@ export default function NewArticles() {
 
   const defaultLocale =
     locales.find((l) => l.primary)?.locale ?? locales[0]?.locale ?? "en";
+
+  const initialIllustrations = useMemo(
+    () =>
+      Object.fromEntries(
+        illustration.surfaces.map((s) => [
+          s.key,
+          emptyChoice(illustration.lastChoice[s.key], illustration.templates, illustration.images),
+        ]),
+      ) as Record<string, IllustrationChoiceDraft>,
+    [illustration],
+  );
 
   const [product, setProduct] = useState<{ id: string; title: string } | null>(
     null,
@@ -121,6 +194,7 @@ export default function NewArticles() {
   const [pastedTitle, setPastedTitle] = useState("");
   const [pastedText, setPastedText] = useState("");
   const [mode, setMode] = useState("standard");
+  const [illustrations, setIllustrations] = useState(initialIllustrations);
   const [clientError, setClientError] = useState<string | null>(null);
 
   const isSubmitting = navigation.state === "submitting";
@@ -135,6 +209,25 @@ export default function NewArticles() {
       setClientError(null);
     }
   }, [shopify]);
+
+  const updateIllustration = useCallback(
+    (surfaceKey: string, update: ChoiceUpdater) => {
+      setIllustrations((prev) => ({
+        ...prev,
+        [surfaceKey]: update(
+          prev[surfaceKey] ??
+            emptyChoice(undefined, illustration.templates, illustration.images),
+        ),
+      }));
+    },
+    [illustration.images, illustration.templates],
+  );
+
+  const firstUrl = urls
+    .split(/\r?\n/)
+    .map((u) => u.trim())
+    .find((u) => u.startsWith("http"));
+  const urlCount = urls.split(/\r?\n/).filter((u) => u.trim()).length;
 
   const handleSubmit = useCallback(() => {
     if (!product) {
@@ -156,10 +249,20 @@ export default function NewArticles() {
         pastedTitle,
         pastedText,
         mode,
+        illustrations: JSON.stringify(
+          Object.fromEntries(
+            Object.entries(illustrations).map(([k, d]) => [k, choiceToSubmission(d)]),
+          ),
+        ),
+        illustrationMemory: JSON.stringify(
+          Object.fromEntries(
+            Object.entries(illustrations).map(([k, d]) => [k, choiceToMemory(d)]),
+          ),
+        ),
       },
       { method: "POST" },
     );
-  }, [product, locale, urls, pastedTitle, pastedText, mode, submit]);
+  }, [product, locale, urls, pastedTitle, pastedText, mode, illustrations, submit]);
 
   const error = clientError ?? actionData?.error;
 
@@ -278,6 +381,63 @@ export default function NewArticles() {
                     helpText="Use this when the article is not publicly reachable yet."
                   />
                 </BlockStack>
+                {illustration.surfaces.length > 0 && (
+                  <>
+                    <Divider />
+                    <BlockStack gap="300">
+                      <BlockStack gap="100">
+                        <Text as="h2" variant="headingMd">
+                          Illustrations
+                        </Text>
+                        <Text as="p" variant="bodySm" tone="subdued">
+                          Optional, applies to every article in this batch.
+                          With several URLs, choose Auto: Claude reads each
+                          article when it generates and draws the best idea for
+                          it. "Recommend 5 ideas" below reads
+                          {firstUrl
+                            ? ` the first URL only (${urlCount > 1 ? `${urlCount} given` : "1 given"})`
+                            : pastedText.trim()
+                              ? " the pasted article"
+                              : " the first URL or the pasted article"}
+                          . Everything can be changed later on each page's
+                          review screen.
+                        </Text>
+                      </BlockStack>
+                      {illustration.surfaces.map((s) => (
+                        <IllustrationChoice
+                          key={s.key}
+                          surfaceKey={s.key}
+                          surfaceLabel={s.label}
+                          value={
+                            illustrations[s.key] ??
+                            emptyChoice(undefined, illustration.templates, illustration.images)
+                          }
+                          onChange={(update) => updateIllustration(s.key, update)}
+                          templates={illustration.templates}
+                          images={illustration.images}
+                          locales={[locale]}
+                          recommend={(surfaceKey) =>
+                            requestRecommendations({
+                              surfaceKey,
+                              locale,
+                              sourceKind: "article",
+                              ...(firstUrl
+                                ? { url: firstUrl }
+                                : {
+                                    sourceText: [pastedTitle, pastedText]
+                                      .filter((t) => t.trim())
+                                      .join("\n\n"),
+                                  }),
+                              productTitle: product?.title ?? "",
+                            })
+                          }
+                          openaiConfigured={illustration.openaiConfigured}
+                          costPerImage={illustration.costPerImage}
+                        />
+                      ))}
+                    </BlockStack>
+                  </>
+                )}
                 <InlineStack align="end">
                   <Button
                     variant="primary"

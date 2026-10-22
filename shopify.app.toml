@@ -27,8 +27,11 @@ redirect_urls = ["https://cellexia-page-tailor.onrender.com/auth/callback"]
 # read_translations  -> localized copy managed by Translate & Adapt
 # read_locales       -> published shop locales and URL prefixes
 # read_orders        -> experiment metrics (orders/AOV/revenue for baseline vs treatment)
-# The app never writes to products: variants live in the app database only.
-scopes = "read_products,read_translations,read_locales,read_orders"
+# write_files        -> illustrations are stored in the store's Files (Shopify CDN)
+# The app never writes to products, metafields or translations: variants
+# live in the app database only; the only thing it writes to the store is
+# image files for illustrations.
+scopes = "read_products,read_translations,read_locales,read_orders,write_files"
 
 # Storefront requests to /apps/cx/* are proxied to this app at /proxy/*.
 # The Shopify CLI rewrites `url` automatically during `shopify app dev`.
