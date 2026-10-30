@@ -1197,7 +1197,17 @@ const RISKY_PATTERNS: Array<{
  * backstop applied to every generated text before it is stored.
  */
 export function normalizeGeneratedPunctuation(text: string): string {
-  return text.replace(/[ \t]*[—–][ \t]*/g, " - ");
+  return text
+    // Backstop for a model quirk: Claude's structured JSON output can
+    // double-escape a special character (trademark/registered/copyright
+    // symbols are the classic trigger) by emitting two backslashes before
+    // the "u" instead of one. JSON.parse then correctly decodes the doubled
+    // backslash into a literal six-character escape sequence (backslash,
+    // "u", four hex digits) instead of the intended glyph. Repair any such
+    // literal sequence that survived parsing; legitimate copy never
+    // contains this pattern, so it is a no-op otherwise.
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/[ \t]*[—–][ \t]*/g, " - ");
 }
 
 const ARTICLE_OK_SUFFIX = " (supported by the article)";
