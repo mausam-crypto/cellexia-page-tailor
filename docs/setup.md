@@ -37,18 +37,21 @@ answers for real storefront traffic of the installed shop.
 
 | Scope | Why |
 | --- | --- |
-| `read_products` | Product copy (`descriptionHtml`) and metafields — Accentuate fields are plain metafields |
+| `write_products` | Product copy (`descriptionHtml`, title) and metafields to read — Accentuate fields are plain metafields (includes `read_products`) — plus ONE app-owned, storefront-invisible product metafield the app writes: the basket name map of Ingredient focus pages (`$app.cart_titles`, declared in `shopify.app.toml`) |
 | `read_translations` | Localized copy managed by Translate & Adapt (Translations API) |
 | `read_locales` | Published shop locales, used to localize base copy and build variant URLs |
 | `read_orders` | Experiment tracker only — syncs order totals for the baseline/treatment windows |
 | `write_files` | Illustrations only — uploaded and drawn images are stored in the store's Files (Shopify CDN) and deleted from there when removed from the library |
+| `write_cart_transforms` | Basket rename only — creates (and deletes) the app's Cart Transform function registration when the merchant activates it in Settings (Shopify Plus) |
 
-The app never modifies products, metafields, orders, or translations; the
-only thing it writes to the store is image files. Variants live only in the
-app database. Shops that installed before a scope was added (`read_orders`,
-`write_files`) are prompted to approve it the next time they open the app;
-until then the Image library shows a permission banner and drawings fail with
-that message.
+The app never edits product content, translations or orders; it writes
+image files (illustrations) and the app-owned basket name metafield, nothing
+else. Variants live only in the app database. Shops that installed before a
+scope was added (`read_orders`, `write_files`, `write_products`,
+`write_cart_transforms`) are prompted to approve it the next time they open
+the app; until then the Image library shows a permission banner, drawings
+fail with that message, and the Basket rename card in Settings shows
+"Permission needed".
 
 ### Database
 
@@ -137,6 +140,15 @@ on the product page:
    theme you're editing and confirm the right block swaps. If the selector
    matches nothing, the page simply renders unchanged — check the selector in
    DevTools with `document.querySelector('...')`.
+10. **Product name (Ingredient focus pages only):** the *Product name*
+    surface is disabled by default. To let focus pages rename the product on
+    the page (and in the basket, see §9), enable it and set the selector of
+    the heading that prints the product name, e.g. `.product__title h1`
+    (Dawn family) or the theme's own hook; never the `<title>` tag (it is
+    rejected). If the theme has a sticky add-to-cart bar that repeats the
+    name, add its selector after a comma. Add the same selector to the
+    embed's "Selectors to hold during swap" setting to avoid a flash of the
+    old name. Swap mode is always Plain text.
 
 ## 4. Locales
 
@@ -358,3 +370,109 @@ of every drawing's recorded cost, UTC month) reaches it, drawing pauses with
 a clear message; copy generation and library images are unaffected. The
 budget is checked before each drawing, so a batch can overshoot by the
 drawings already in flight.
+
+## 9. Ingredient focus pages and the basket rename
+
+**Ingredient focus** (README → *Ingredient focus*) renames the product on the
+page through the *Product name* surface (§3, item 10). The **basket rename**
+makes the new name follow the item into the basket, the checkout, the order
+and its emails, without duplicating the product. It is a Shopify Function
+(`extensions/cart-rename`, a Cart Transform with a `lineUpdate` operation)
+that Shopify runs only on **Shopify Plus** stores (and development stores).
+
+### How it works
+
+1. On a live focus page whose heading is renamed, the theme embed adds two
+   hidden properties to this product's add-to-cart form(s): `_cx` (the
+   page's variant code) and `_Original product` (the original name, a
+   staff note). Recommendation and quick-add forms for other products are
+   never touched.
+2. The app keeps, on the product, an app-owned JSON metafield
+   (`$app.cart_titles`, "Page Tailor basket titles", read-only in the admin)
+   mapping each live focus page's code to its product name. It is rewritten
+   whenever a focus page is generated, refined, edited, restored,
+   duplicated, deleted, put live or taken offline, and when serving or the
+   Product name surface changes in Settings.
+3. The function renames any basket line whose `_cx` code is in the map.
+   Lines bought on a selling plan (subscriptions) are skipped: Shopify does
+   not allow `lineUpdate` there.
+
+The rename applies only while: the basket rename is **Active** in Settings,
+serving is **On**, the *Product name* surface is **enabled with a
+selector**, and the page is **live**. Taking the page offline (or switching
+serving off) removes its entry; baskets already holding the item revert on
+their next change. Placed orders keep the title they were placed with.
+
+### Activation (once per store)
+
+1. Deploy: `npm run deploy` pushes the function, the updated scopes and the
+   metafield definition (the CLI writes the function's `uid` into
+   `extensions/cart-rename/shopify.extension.toml` on the first deploy;
+   never re-scaffold that extension or rename its handle afterwards).
+2. Open the app once: Shopify asks to approve the updated permissions
+   (`write_products`, `write_cart_transforms`). Your staff account needs
+   the *Products* and *Store settings/preferences* permissions for the next
+   step.
+3. Settings → **Basket rename**: press **Activate**. The badge turns
+   *Active*. The card tells you when something is missing (permission,
+   function not deployed, store not on Plus).
+4. Settings → *Product name* surface: enable it and set its selector (§3,
+   item 10). Save.
+
+*Deactivate* deletes the registration and clears every product's map;
+focus pages keep their new name on the page.
+
+### Store-side edits (theme developer)
+
+Shopify shows the renamed line in the checkout, the thank-you page, the
+admin order and the packing slip with no edit. Two templates print the
+product's real name unless changed:
+
+- **Theme basket drawer and basket page.** Dawn-family themes print
+  `item.product.title`; change it to `item.title` wherever the product name
+  is printed. Files: `sections/main-cart-items.liquid`
+  (`{{ item.product.title | escape }}` → `{{ item.title | escape }}`),
+  `snippets/cart-drawer.liquid` (`{{- item.product.title | escape -}}` →
+  `{{- item.title | escape -}}`) and, if present,
+  `snippets/cart-notification-product.liquid`. Caveat: on lines that are
+  not renamed, `item.title` is "Product - Variant"; a theme that prints the
+  variant options separately can guard it:
+  `{% if item.title != item.product.title | append: ' - ' | append: item.variant.title %}{{ item.title }}{% else %}{{ item.product.title }}{% endif %}`
+  (or check `item.product.has_only_default_variant`). Dawn's cart templates
+  already hide properties whose name starts with `_`.
+- **Order notification templates** (Settings → Notifications → Order
+  confirmation, Shipping confirmation, Shipping update, Order edited, Refund,
+  Draft order invoice). Shopify's stock templates contain
+  `{% if line.product.title %}{% assign line_title = line.product.title %}{% else %}{% assign line_title = line.title %}{% endif %}`,
+  which prints the ORIGINAL name; replace it with
+  `{% assign line_title = line.title %}`.
+- **Packing slip** (optional; Settings → Shipping and delivery → Packing
+  slip template): the default prints `line_item.title` (the new name) and
+  no properties. To print the staff note, add inside the line-items loop:
+  `{% for p in line_item.properties %}{% if p.first == '_Original product' %}<p>Original product: {{ p.last }}</p>{% endif %}{% endfor %}`.
+
+### Embed setting: JSON add-to-cart
+
+Themes whose add-to-cart button sends JSON to `/cart/add.js` instead of
+submitting the product form never carry hidden inputs. If a focus page shows
+the new name on the page but the basket keeps the old one even after the
+theme edit above, switch on the embed setting **"Basket rename: also tag
+JSON add-to-cart requests"** (theme editor → App embeds → Page Tailor). It is
+off by default because a global `fetch` wrapper can collide with other
+apps' wrappers.
+
+### Troubleshooting
+
+- *Permission needed* in Settings: reload the app in Shopify and approve the
+  updated permissions; the badge updates on the next load.
+- *Function not deployed*: run `npm run deploy` from the app's folder (the
+  deploy must include the `cart-rename` extension), then reload Settings.
+- "Access denied" on Activate: the permissions are not approved yet, or
+  your staff account lacks the products and preferences permissions.
+- The page shows the new name but the basket does not: check the four
+  conditions above, the theme edit, then the JSON embed setting. Items added
+  from a normal product page are never renamed, by design.
+- Subscription lines keep the original name (Shopify limitation).
+- Function run logs: Dev Dashboard → your app → Logs, Type = Function.
+- The staff note `_Original product` (and `_cx`) show in the admin order and
+  in order webhooks; they are hidden at checkout and in notifications.

@@ -126,7 +126,30 @@ export function figureSourceText(article: {
   briefText: string | null;
   briefAdvanced: string | null;
   briefReferences: string | null;
+  /** Ingredient focus pages: the focus leads the source so Recommend and
+   *  Auto draw about it. */
+  mode?: string | null;
+  focusTerm?: string | null;
+  focusFacts?: string | null;
 }): string {
+  if (article.mode === "focus") {
+    const focusLines = [
+      article.focusTerm?.trim()
+        ? `Focus: this page positions the product around ${article.focusTerm.trim()} (every illustration should be about it)`
+        : `Focus: this page positions the product around one ingredient or concern inferred from the article (every illustration should be about it)`,
+      ...(article.focusFacts?.trim()
+        ? ["Facts about the focus:", article.focusFacts.trim()]
+        : []),
+      "",
+    ];
+    return [
+      ...focusLines,
+      figureSourceText({ ...article, mode: null }),
+    ]
+      .join("\n")
+      .trim()
+      .slice(0, MAX_SOURCE_CHARS);
+  }
   if (article.sourceKind === "brief") {
     const advanced = normalizeBriefAdvanced(article.briefAdvanced);
     const extras = BRIEF_ADVANCED_FIELDS.filter(({ key }) => advanced[key]).map(

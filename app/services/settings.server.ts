@@ -3,6 +3,7 @@ import type { CopySurface, ShopSettingsData } from "./types";
 import {
   DEFAULT_ILLUSTRATION_SETTINGS,
   DEFAULT_SUBTLE_SETTINGS,
+  TITLE_SURFACE_KEY,
   normalizeIllustrationSettings,
   normalizeSubtleSettings,
 } from "./types";
@@ -70,6 +71,20 @@ export const PAGE_SURFACES: CopySurface[] = [
   },
 ];
 
+// The product name. Plain text from the Admin API product title (translated
+// per locale), generated ONLY by Ingredient focus pages and served only when
+// the merchant enables it here with a selector; the basket rename keys on
+// the same gate. Disabled by default: renaming the product is a deliberate
+// choice, and the selector depends on the theme.
+export const TITLE_SURFACE: CopySurface = {
+  key: TITLE_SURFACE_KEY,
+  label: "Product name (title)",
+  source: "title",
+  selector: "",
+  mode: "text",
+  enabled: false,
+};
+
 export function surfaceKeyForMetafield(namespace: string, key: string): string {
   return `mf:${namespace}:${key}`;
 }
@@ -81,9 +96,12 @@ export async function getSettings(shop: string): Promise<ShopSettingsData> {
       paramName: "cx",
       intensity: "light",
       subtle: DEFAULT_SUBTLE_SETTINGS,
-      surfaces: DEFAULT_SURFACES,
+      surfaces: [...DEFAULT_SURFACES, TITLE_SURFACE],
       servingEnabled: false,
       illustrations: DEFAULT_ILLUSTRATION_SETTINGS,
+      basketRenameEnabled: false,
+      cartTransformId: null,
+      basketRenameError: null,
     };
   }
   let subtleRaw: unknown = {};
@@ -108,6 +126,7 @@ export async function getSettings(shop: string): Promise<ShopSettingsData> {
   for (const pageSurface of PAGE_SURFACES) {
     if (!keys.has(pageSurface.key)) surfaces = [...surfaces, pageSurface];
   }
+  if (!keys.has(TITLE_SURFACE.key)) surfaces = [...surfaces, TITLE_SURFACE];
   return {
     paramName: row.paramName,
     intensity:
@@ -118,6 +137,9 @@ export async function getSettings(shop: string): Promise<ShopSettingsData> {
     surfaces,
     servingEnabled: row.servingEnabled,
     illustrations: normalizeIllustrationSettings(row.illustrationSettings),
+    basketRenameEnabled: row.basketRenameEnabled,
+    cartTransformId: row.cartTransformId,
+    basketRenameError: row.basketRenameError,
   };
 }
 
@@ -135,6 +157,15 @@ export async function saveSettings(
     illustrations: data.illustrations
       ? normalizeIllustrationSettings(data.illustrations)
       : current.illustrations,
+    basketRenameEnabled: data.basketRenameEnabled ?? current.basketRenameEnabled,
+    cartTransformId:
+      data.cartTransformId !== undefined
+        ? data.cartTransformId
+        : current.cartTransformId,
+    basketRenameError:
+      data.basketRenameError !== undefined
+        ? data.basketRenameError
+        : current.basketRenameError,
   };
   const fields = {
     paramName: merged.paramName,
@@ -143,6 +174,9 @@ export async function saveSettings(
     surfaces: JSON.stringify(merged.surfaces),
     servingEnabled: merged.servingEnabled,
     illustrationSettings: JSON.stringify(merged.illustrations),
+    basketRenameEnabled: merged.basketRenameEnabled,
+    cartTransformId: merged.cartTransformId,
+    basketRenameError: merged.basketRenameError,
   };
   await prisma.shopSettings.upsert({
     where: { shop },

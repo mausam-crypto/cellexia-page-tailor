@@ -85,9 +85,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   const pastedTitle = String(formData.get("pastedTitle") ?? "");
   const pastedText = String(formData.get("pastedText") ?? "");
   const mode = String(formData.get("mode") ?? "standard");
+  const focusTerm = String(formData.get("focusTerm") ?? "").trim();
+  const focusFacts = String(formData.get("focusFacts") ?? "").trim();
 
   if (!productId) return { error: "Select a product first." };
   if (!locale) return { error: "Select a language." };
+  if (focusTerm.length > 120) {
+    return { error: "Keep the focus under 120 characters (an ingredient or a concern)." };
+  }
+  if (focusFacts.length > 20_000) {
+    return { error: "The facts about the focus are too long (max 20,000 characters)." };
+  }
 
   const urls = urlsRaw
     .split(/\r?\n/)
@@ -137,6 +145,8 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       pastedText,
       mode,
       illustrationPlan: Object.keys(plan).length > 0 ? JSON.stringify(plan) : null,
+      focusTerm: mode === "focus" ? focusTerm || null : null,
+      focusFacts: mode === "focus" ? focusFacts || null : null,
     });
   } catch (error) {
     return {
@@ -194,6 +204,8 @@ export default function NewArticles() {
   const [pastedTitle, setPastedTitle] = useState("");
   const [pastedText, setPastedText] = useState("");
   const [mode, setMode] = useState("standard");
+  const [focusTerm, setFocusTerm] = useState("");
+  const [focusFacts, setFocusFacts] = useState("");
   const [illustrations, setIllustrations] = useState(initialIllustrations);
   const [clientError, setClientError] = useState<string | null>(null);
 
@@ -249,6 +261,8 @@ export default function NewArticles() {
         pastedTitle,
         pastedText,
         mode,
+        focusTerm: mode === "focus" ? focusTerm : "",
+        focusFacts: mode === "focus" ? focusFacts : "",
         illustrations: JSON.stringify(
           Object.fromEntries(
             Object.entries(illustrations).map(([k, d]) => [k, choiceToSubmission(d)]),
@@ -262,7 +276,18 @@ export default function NewArticles() {
       },
       { method: "POST" },
     );
-  }, [product, locale, urls, pastedTitle, pastedText, mode, illustrations, submit]);
+  }, [
+    product,
+    locale,
+    urls,
+    pastedTitle,
+    pastedText,
+    mode,
+    focusTerm,
+    focusFacts,
+    illustrations,
+    submit,
+  ]);
 
   const error = clientError ?? actionData?.error;
 
@@ -356,11 +381,39 @@ export default function NewArticles() {
                       label: "Ultra Custom V2 — the page as the article's sequel",
                       value: "v2",
                     },
+                    {
+                      label:
+                        "Ingredient focus — reposition the whole page, name included, around one ingredient or concern",
+                      value: "focus",
+                    },
                   ]}
                   value={mode}
                   onChange={setMode}
-                  helpText="Applies to every article in this batch (changeable per article later). Subtle intent stays as conservative as a light Standard pass but plants a few precise sentences that position the product for the reader's exact concern - naming it only when a brand would naturally say it unprompted (a night cream article yields night-cream copy; a collagen-alternatives article yields 'supports collagen production', never 'collagen alternative'); tune it in Settings. Meta mode pulls the article's study wins, rankings, and statistics into the copy — for Meta (Facebook/Instagram) funnels only. Ultra custom recenters the whole page on the article audience's intent and vocabulary (e.g. face creams for men, night creams), may drop claims irrelevant to that audience, and never pulls proof elements. Ultra deep persona goes further: it builds a ranked list of everything that audience wants to hear and places the top items in the tagline, description, and overview. Conversion Max runs three ranked lists (desires, objections, decision criteria), sequences the page for the reader's awareness stage, answers doubts where they arise, quietly excels on the article's evaluation criteria, and tailors the FAQ tab - all organic, no proof elements. Ultra Custom V2 treats the page as the article's sequel: it confirms every expectation the article set, leads with what the article did not already say, is strongest where the article found the alternatives lacking, answers the questions the article left open, and moderately tightens the page for nearly-sold readers."
+                  helpText="Applies to every article in this batch (changeable per article later). Subtle intent stays as conservative as a light Standard pass but plants a few precise sentences that position the product for the reader's exact concern - naming it only when a brand would naturally say it unprompted (a night cream article yields night-cream copy; a collagen-alternatives article yields 'supports collagen production', never 'collagen alternative'); tune it in Settings. Meta mode pulls the article's study wins, rankings, and statistics into the copy — for Meta (Facebook/Instagram) funnels only. Ultra custom recenters the whole page on the article audience's intent and vocabulary (e.g. face creams for men, night creams), may drop claims irrelevant to that audience, and never pulls proof elements. Ultra deep persona goes further: it builds a ranked list of everything that audience wants to hear and places the top items in the tagline, description, and overview. Conversion Max runs three ranked lists (desires, objections, decision criteria), sequences the page for the reader's awareness stage, answers doubts where they arise, quietly excels on the article's evaluation criteria, and tailors the FAQ tab - all organic, no proof elements. Ultra Custom V2 treats the page as the article's sequel: it confirms every expectation the article set, leads with what the article did not already say, is strongest where the article found the alternatives lacking, answers the questions the article left open, and moderately tightens the page for nearly-sold readers. Ingredient focus makes the page read as THE product for one ingredient or concern (a vitamin C serum, a brightening treatment): it renames the product (on the page and, with the basket rename, in the basket and the order), leads every section with the focus, may drop other ingredients, and may add facts beyond the article - every addition is listed on the review page under Added facts to verify."
                 />
+                {mode === "focus" && (
+                  <BlockStack gap="300">
+                    <TextField
+                      label="Focus (ingredient or concern)"
+                      value={focusTerm}
+                      onChange={setFocusTerm}
+                      autoComplete="off"
+                      placeholder="e.g. Vitamin C, or skin brightening"
+                      maxLength={120}
+                      helpText="Leave blank to let the AI pick the focus from each article (an article about the best vitamin C serums becomes a vitamin C page); fill it in to force this focus on every article in the batch. The product name keeps the brand and the product type and gets the focus as its descriptor."
+                    />
+                    <TextField
+                      label="Facts about this focus (optional)"
+                      value={focusFacts}
+                      onChange={setFocusFacts}
+                      multiline={4}
+                      autoComplete="off"
+                      placeholder="Approved claims, figures or background about the ingredient or concern the page may use."
+                      maxLength={20000}
+                      helpText="Material the page may draw on. The AI may also use general cosmetic knowledge and add claims of its own; everything beyond the article and these facts is listed for review."
+                    />
+                  </BlockStack>
+                )}
                 <Divider />
                 <BlockStack gap="300">
                   <Text as="h2" variant="headingMd">

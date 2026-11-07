@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import type { ActionFunctionArgs, LoaderFunctionArgs } from "@remix-run/node";
 import {
   useActionData,
+  useFetcher,
   useLoaderData,
   useNavigation,
   useSubmit,
@@ -11,11 +12,13 @@ import {
   Banner,
   BlockStack,
   Box,
+  Button,
   Card,
   Checkbox,
   InlineGrid,
   InlineStack,
   Layout,
+  Modal,
   Page,
   Select,
   Text,
@@ -28,6 +31,7 @@ import { authenticate } from "../shopify.server";
 import {
   DEFAULT_SURFACES,
   PAGE_SURFACES,
+  TITLE_SURFACE,
   getSettings,
   saveSettings,
   surfaceKeyForMetafield,
@@ -43,6 +47,7 @@ import type {
   SubtleModeSettings,
 } from "../services/types";
 import {
+  TITLE_SURFACE_KEY,
   illustrationsAllowed,
   normalizeIllustrationQuality,
   normalizeSubtleSettings,
@@ -53,6 +58,13 @@ import {
   imageModelConfigured,
   typicalCostUsd,
 } from "../services/openai-images.server";
+import {
+  activateBasketRename,
+  basketRenameStatus,
+  deactivateBasketRename,
+  type BasketRenameStatus,
+} from "../services/cart-rename.server";
+import { syncCartTitlesForShop } from "../services/cart-titles.server";
 
 const PARAM_NAME_RE = /^[a-z0-9_]{1,12}$/;
 
@@ -83,13 +95,18 @@ function defaultModeForType(type: string): "text" | "html" {
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
-  const [settings, approvedCount, spentThisMonth] = await Promise.all([
-    getSettings(session.shop),
-    prisma.article.count({
-      where: { shop: session.shop, status: "approved" },
-    }),
-    monthSpend(session.shop).catch(() => 0),
-  ]);
+  const [settings, approvedCount, spentThisMonth, basketRename, focusPageCount] =
+    await Promise.all([
+      getSettings(session.shop),
+      prisma.article.count({
+        where: { shop: session.shop, status: "approved" },
+      }),
+      monthSpend(session.shop).catch(() => 0),
+      basketRenameStatus(admin, session.shop),
+      prisma.article.count({
+        where: { shop: session.shop, generatedMode: "focus" },
+      }),
+    ]);
   // Metafield definitions come from the Admin API; if it hiccups, still show
   // the page (description surface + previously saved metafield surfaces).
   // Cached: the paginated listing runs at most once per TTL, not per load.
@@ -123,6 +140,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
   for (const pageSurface of PAGE_SURFACES) {
     rows.push(existing.get(pageSurface.key) ?? pageSurface);
   }
+  // The product name: used only by Ingredient focus pages.
+  rows.push(existing.get(TITLE_SURFACE.key) ?? TITLE_SURFACE);
   for (const def of definitions) {
     const key = surfaceKeyForMetafield(def.namespace, def.key);
     rows.push(
@@ -168,12 +187,31 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       high: typicalCostUsd("high"),
       xhigh: typicalCostUsd("xhigh"),
     },
+    basketRename,
+    focusPageCount,
   };
 };
 
 export const action = async ({ request }: ActionFunctionArgs) => {
-  const { session } = await authenticate.admin(request);
+  const { admin, session } = await authenticate.admin(request);
   const formData = await request.formData();
+
+  // Basket rename activation is its own action (a fetcher button), apart
+  // from the settings form.
+  const intent = String(formData.get("intent") ?? "");
+  if (intent === "basketRenameActivate" || intent === "basketRenameDeactivate") {
+    const result =
+      intent === "basketRenameActivate"
+        ? await activateBasketRename(admin, session.shop)
+        : await deactivateBasketRename(admin, session.shop);
+    return {
+      ok: result.ok,
+      intent,
+      error: result.ok ? null : result.message,
+      message: result.ok ? result.message : null,
+      warnings: result.warnings,
+    };
+  }
 
   const paramName = String(formData.get("paramName") ?? "cx");
   const intensityRaw = String(formData.get("intensity") ?? "light");
@@ -210,7 +248,9 @@ export const action = async ({ request }: ActionFunctionArgs) => {
             ? ("metafield" as const)
             : r.source === "page"
               ? ("page" as const)
-              : ("description" as const),
+              : r.source === "title"
+                ? ("title" as const)
+                : ("description" as const),
         namespace: r.namespace ? String(r.namespace) : undefined,
         metafieldKey: r.metafieldKey ? String(r.metafieldKey) : undefined,
         selector: String(r.selector ?? "").trim(),
@@ -276,6 +316,14 @@ export const action = async ({ request }: ActionFunctionArgs) => {
         error: `"${s.label || s.key}" is a live page region and must use the HTML swap mode.`,
       };
     }
+    // The product name is one line of text; swapping it as HTML would let
+    // a hand edit put markup into the heading.
+    if (s.source === "title" && s.mode !== "text") {
+      return {
+        ok: false as const,
+        error: `"${s.label || s.key}" is the product name and must use the Plain text swap mode.`,
+      };
+    }
     // An enabled surface without a selector generates copy that can never
     // serve — force an explicit decision instead of a silent no-op.
     if (!s.selector) {
@@ -310,7 +358,23 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     servingEnabled,
     illustrations,
   });
-  return { ok: true as const, savedAt: Date.now() };
+
+  // The basket name map follows the serving switch and the Product name
+  // surface exactly: re-sync when either changed (best-effort; a failure
+  // shows on the focus pages and here).
+  const before = current;
+  const titleBefore = before.surfaces.find((s) => s.key === TITLE_SURFACE_KEY);
+  const titleAfter = surfaces.find((s) => s.key === TITLE_SURFACE_KEY);
+  const gateChanged =
+    before.servingEnabled !== servingEnabled ||
+    (titleBefore?.enabled ?? false) !== (titleAfter?.enabled ?? false) ||
+    (titleBefore?.selector ?? "") !== (titleAfter?.selector ?? "") ||
+    (titleBefore?.mode ?? "text") !== (titleAfter?.mode ?? "text");
+  let cartWarnings: string[] = [];
+  if (gateChanged && current.basketRenameEnabled) {
+    cartWarnings = await syncCartTitlesForShop(session.shop, admin);
+  }
+  return { ok: true as const, savedAt: Date.now(), cartWarnings };
 };
 
 /** Client-side mirror of the server checks so problems show on the field. */
@@ -355,14 +419,35 @@ export default function Settings() {
   const [houseStyle, setHouseStyle] = useState(loaderData.illustrations.houseStyle);
 
   const isSaving = navigation.state === "submitting";
+  const basketFetcher = useFetcher<typeof action>();
+  const basketBusy = basketFetcher.state !== "idle";
+  const [basketConfirmOpen, setBasketConfirmOpen] = useState(false);
 
   useEffect(() => {
-    if (actionData?.ok) {
+    if (actionData?.ok && !("intent" in actionData)) {
       shopify.toast.show("Settings saved");
+      const warnings =
+        "cartWarnings" in actionData ? (actionData.cartWarnings as string[]) : [];
+      for (const warning of warnings) shopify.toast.show(warning, { isError: true });
     }
   }, [actionData, shopify]);
 
-  const saveError = actionData && !actionData.ok ? actionData.error : null;
+  useEffect(() => {
+    if (basketFetcher.state !== "idle" || !basketFetcher.data) return;
+    const data = basketFetcher.data;
+    if (!("intent" in data)) return;
+    if (!data.ok && "error" in data && data.error) {
+      shopify.toast.show(String(data.error), { isError: true });
+      return;
+    }
+    if ("message" in data && data.message) shopify.toast.show(String(data.message));
+    const warnings = "warnings" in data ? (data.warnings as string[]) : [];
+    for (const warning of warnings) shopify.toast.show(warning, { isError: true });
+  }, [basketFetcher.state, basketFetcher.data, shopify]);
+
+  const saveError =
+    actionData && !actionData.ok && !("intent" in actionData) ? actionData.error : null;
+  const basketRename: BasketRenameStatus = loaderData.basketRename;
 
   const updateRow = useCallback(
     (key: string, patch: Partial<CopySurface>) => {
@@ -450,6 +535,106 @@ export default function Settings() {
                   onChange={setServingEnabled}
                   helpText="Off by default after install: nothing on your site changes until you turn this on. This is the master gate in front of the automatic go-live: generated variants only actually serve while it is on. Turning it off is the emergency stop — every variant URL renders the normal product page again within ~2 minutes for new visitors (up to ~4 minutes with client-side caches)."
                 />
+              </BlockStack>
+            </Card>
+
+            <Card>
+              <BlockStack gap="300">
+                <InlineStack align="space-between" blockAlign="center">
+                  <Text as="h2" variant="headingMd">
+                    Basket rename (Ingredient focus pages, Shopify Plus)
+                  </Text>
+                  {basketRename.enabled ? (
+                    <Badge tone="success">Active</Badge>
+                  ) : basketRename.missingScopes.length > 0 ? (
+                    <Badge tone="attention">Permission needed</Badge>
+                  ) : !basketRename.deployed ? (
+                    <Badge tone="attention">Not deployed</Badge>
+                  ) : basketRename.plus === false ? (
+                    <Badge tone="warning">Plus required</Badge>
+                  ) : (
+                    <Badge>Off</Badge>
+                  )}
+                </InlineStack>
+                <Text as="p" variant="bodyMd" tone="subdued">
+                  An Ingredient focus page renames the product on the page.
+                  With the basket rename active, an item added to the basket
+                  from such a page keeps the new name in the basket, the
+                  checkout, the order and its emails, with a hidden staff note
+                  carrying the original name. Shopify allows this only on
+                  Shopify Plus (or a development store). It applies only while
+                  serving is on and the Product name surface below is enabled
+                  with a selector, and only to items added from a tailored
+                  page.
+                </Text>
+                {basketRename.error && (
+                  <Banner tone="critical" title="Last attempt failed">
+                    {basketRename.error}
+                  </Banner>
+                )}
+                {basketRename.missingScopes.length > 0 && (
+                  <Banner tone="warning" title="Permission needed">
+                    The app needs the {basketRename.missingScopes.join(" and ")}{" "}
+                    permission{basketRename.missingScopes.length > 1 ? "s" : ""}. Reload
+                    the app in Shopify to approve the updated permissions.
+                  </Banner>
+                )}
+                {!basketRename.deployed && basketRename.missingScopes.length === 0 && (
+                  <Banner tone="warning" title="Function not deployed">
+                    The basket rename function has not been deployed to Shopify
+                    yet. Run <code>npm run deploy</code> from the app's folder,
+                    then reload this page.
+                  </Banner>
+                )}
+                {basketRename.plus === false && (
+                  <Banner tone="warning" title="Shopify Plus required">
+                    This store is not on Shopify Plus, so Shopify will ignore
+                    the rename even if it is activated.
+                  </Banner>
+                )}
+                <Text as="p" variant="bodySm" tone="subdued">
+                  Two store-side edits are needed from your theme developer
+                  before the new name shows everywhere: the theme's basket
+                  drawer and basket page (print the basket line title instead
+                  of the product title), and the order notification templates
+                  (same change). The checkout, the admin order and the packing
+                  slip need no edit. See the setup guide, section
+                  &quot;Basket rename&quot;.
+                </Text>
+                <InlineStack gap="300" blockAlign="center">
+                  {basketRename.enabled ? (
+                    <Button
+                      tone="critical"
+                      loading={basketBusy}
+                      onClick={() => setBasketConfirmOpen(true)}
+                    >
+                      Deactivate
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="primary"
+                      loading={basketBusy}
+                      disabled={
+                        basketRename.missingScopes.length > 0 || !basketRename.deployed
+                      }
+                      onClick={() =>
+                        basketFetcher.submit(
+                          { intent: "basketRenameActivate" },
+                          { method: "POST" },
+                        )
+                      }
+                    >
+                      Activate
+                    </Button>
+                  )}
+                  <Text as="span" variant="bodySm" tone="subdued">
+                    {loaderData.focusPageCount === 0
+                      ? "No Ingredient focus page yet."
+                      : `${loaderData.focusPageCount} Ingredient focus page${
+                          loaderData.focusPageCount === 1 ? "" : "s"
+                        } so far.`}
+                  </Text>
+                </InlineStack>
               </BlockStack>
             </Card>
 
@@ -714,14 +899,18 @@ export default function Settings() {
                           <Text as="h3" variant="headingSm">
                             {row.source === "description"
                               ? "Product description"
-                              : row.label || row.metafieldKey}
+                              : row.source === "title"
+                                ? "Product name"
+                                : row.label || row.metafieldKey}
                           </Text>
                           <Text as="span" variant="bodySm" tone="subdued">
                             {row.source === "description"
                               ? "Native product description (body_html)"
                               : row.source === "page"
                                 ? "Live page region — original copy is read from the rendered storefront page, so the whole container (heading + body) is adapted together"
-                                : `Metafield ${row.namespace}.${row.metafieldKey}`}
+                                : row.source === "title"
+                                  ? "The product's name (its Shopify title, translated per language). Used ONLY by Ingredient focus pages, which rename the product: the selector is the heading that shows the name on the product page (never the <title> tag). Add your theme's sticky-bar title selector after a comma if it has one. The basket rename (below) only works while this surface is enabled."
+                                  : `Metafield ${row.namespace}.${row.metafieldKey}`}
                           </Text>
                         </BlockStack>
                         <InlineStack gap="400" blockAlign="center" wrap>
@@ -769,11 +958,13 @@ export default function Settings() {
                             { label: "Plain text", value: "text" },
                           ]}
                           value={row.mode}
-                          disabled={row.source === "page"}
+                          disabled={row.source === "page" || row.source === "title"}
                           helpText={
                             row.source === "page"
                               ? "Always HTML for live page regions"
-                              : undefined
+                              : row.source === "title"
+                                ? "Always plain text for the product name"
+                                : undefined
                           }
                           onChange={(value) =>
                             updateRow(row.key, {
@@ -810,6 +1001,31 @@ export default function Settings() {
           </BlockStack>
         </Layout.Section>
       </Layout>
+      <Modal
+        open={basketConfirmOpen}
+        onClose={() => setBasketConfirmOpen(false)}
+        title="Deactivate the basket rename?"
+        primaryAction={{
+          content: "Deactivate",
+          destructive: true,
+          onAction: () => {
+            setBasketConfirmOpen(false);
+            basketFetcher.submit({ intent: "basketRenameDeactivate" }, { method: "POST" });
+          },
+        }}
+        secondaryActions={[
+          { content: "Cancel", onAction: () => setBasketConfirmOpen(false) },
+        ]}
+      >
+        <Modal.Section>
+          <Text as="p">
+            Items added from Ingredient focus pages go back to the original
+            product name in the basket and the checkout (existing baskets on
+            their next change). The pages themselves keep their new name on
+            the page.
+          </Text>
+        </Modal.Section>
+      </Modal>
     </Page>
   );
 }

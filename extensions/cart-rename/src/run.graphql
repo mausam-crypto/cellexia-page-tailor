@@ -1,0 +1,29 @@
+# Page Tailor basket rename. For every cart line: the hidden `_cx` property
+# the theme embed sets on an Ingredient focus page, whether the line is on a
+# selling plan (Shopify rejects lineUpdate there), and the product's
+# app-owned basket name map written by the app.
+query RunInput {
+  cart {
+    lines {
+      id
+      attribute(key: "_cx") {
+        value
+      }
+      sellingPlanAllocation {
+        sellingPlan {
+          id
+        }
+      }
+      merchandise {
+        __typename
+        ... on ProductVariant {
+          product {
+            cartTitles: metafield(namespace: "$app", key: "cart_titles") {
+              jsonValue
+            }
+          }
+        }
+      }
+    }
+  }
+}

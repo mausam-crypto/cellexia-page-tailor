@@ -35,11 +35,13 @@ import { refreshFindings } from "../services/generate.server";
 import {
   BRIEF_ADVANCED_FIELDS,
   FIGURE_CLAIM_PREFIX,
+  TITLE_SURFACE_KEY,
   illustrationsAllowed,
   normalizeAdaptationMode,
   normalizeBriefAdvanced,
   normalizeSuggestions,
   parseFigureAlternatives,
+  parseFocusPlan,
   parseSurfaceFigureJob,
   type ConversionPlan,
   type FigureAnchor,
@@ -101,6 +103,18 @@ import {
   enqueueGeneration,
   kickGenerationQueue,
 } from "../services/generation-queue.server";
+import {
+  basketRenameGate,
+  syncCartTitlesForProduct,
+} from "../services/cart-titles.server";
+import {
+  PRODUCT_NAME_MAX_CHARS,
+  cleanProductName,
+  productNameProblem,
+} from "../services/product-name";
+
+const MAX_FOCUS_CHARS = 120;
+const MAX_FOCUS_FACTS_CHARS = 20_000;
 
 /** Freshly queued or actively generating: the copy is about to change.
  *  Stale queue entries (dead worker) stop counting so nothing wedges. */
@@ -277,7 +291,13 @@ async function applyOverrideEdits(
     generatedMode: string;
   },
   formData: FormData,
-): Promise<{ changed: boolean; findingsChanged: boolean; error: string | null }> {
+): Promise<{
+  changed: boolean;
+  findingsChanged: boolean;
+  /** The product name surface was edited or toggled (basket map re-sync). */
+  titleChanged: boolean;
+  error: string | null;
+}> {
   const overrides = await prisma.override.findMany({
     where: { articleId: article.id },
   });
@@ -288,6 +308,7 @@ async function applyOverrideEdits(
   const editedLabels: string[] = [];
   let changed = false;
   let findingsChanged = false;
+  let titleChanged = false;
   for (const o of overrides) {
     const adaptedRaw = formData.get(`adapted_${o.id}`);
     const enabledRaw = formData.get(`enabled_${o.id}`);
@@ -314,6 +335,19 @@ async function applyOverrideEdits(
           adapted = sanitizeAdaptedHtml(adapted, {
             allowedImageSrcs: imageSrcsOf(o.original),
           });
+        } else if (o.surfaceKey === TITLE_SURFACE_KEY) {
+          // The product name: one clean line (it goes into a heading, the
+          // basket and the order).
+          adapted = cleanProductName(adapted);
+          const problem = productNameProblem(adapted);
+          if (willBeEnabled && problem) {
+            return {
+              changed: false,
+              findingsChanged: false,
+              titleChanged: false,
+              error: `The product name ${problem}. Untick "Include this surface" to keep the original name instead.`,
+            };
+          }
         }
         const visibleText =
           o.mode === "html"
@@ -323,6 +357,7 @@ async function applyOverrideEdits(
           return {
             changed: false,
             findingsChanged: false,
+            titleChanged: false,
             error: `"${o.label}" is empty. Untick "Include this surface" instead of clearing its text.`,
           };
         }
@@ -378,6 +413,7 @@ async function applyOverrideEdits(
     if (data.adapted !== undefined || data.enabled !== undefined) {
       editedLabels.push(o.label);
       updates.push(prisma.override.update({ where: { id: o.id }, data }));
+      if (o.surfaceKey === TITLE_SURFACE_KEY) titleChanged = true;
     }
   }
   if (updates.length > 0) {
@@ -400,7 +436,7 @@ async function applyOverrideEdits(
     ]);
     await pruneVersions(article.id);
   }
-  return { changed, findingsChanged, error: null };
+  return { changed, findingsChanged, titleChanged, error: null };
 }
 
 /** Strip the figure's own claim-guard entries from a stored list. */
@@ -645,6 +681,10 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
       sourceTitle: article.sourceTitle,
       detectedQuery: article.detectedQuery,
       mode: article.mode,
+      generatedMode: article.generatedMode,
+      focusTerm: article.focusTerm,
+      focusFacts: article.focusFacts,
+      cartSyncError: article.cartSyncError,
       wasApproved: article.wasApproved,
       reviewedAt: article.reviewedAt ? article.reviewedAt.toISOString() : null,
       generationInFlight: isGenerationInFlight(article),
@@ -659,7 +699,19 @@ export const loader = async ({ request, params }: LoaderFunctionArgs) => {
     conversionPlan: parseConversionPlan(article.conversionPlan),
     v2Plan: parseV2Plan(article.v2Plan),
     subtlePlan: parseSubtlePlan(article.subtlePlan),
-    overrides: article.overrides.map((o) => ({
+    focusPlan: parseFocusPlan(article.focusPlan),
+    // Basket rename status for the focus card (why it is not active, if so).
+    basketRename: basketRenameGate(settings),
+    // The product name surface leads the page, like the heading it renames.
+    overrides: [...article.overrides]
+      .sort((a, b) =>
+        a.surfaceKey === TITLE_SURFACE_KEY
+          ? -1
+          : b.surfaceKey === TITLE_SURFACE_KEY
+            ? 1
+            : 0,
+      )
+      .map((o) => ({
       id: o.id,
       surfaceKey: o.surfaceKey,
       label: o.label,
@@ -763,12 +815,43 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     if (result.error) {
       return { ok: false, intent, error: result.error };
     }
+    // A renamed product renames the basket line too.
+    const cartWarning =
+      result.titleChanged && article.generatedMode === "focus"
+        ? await syncCartTitlesForProduct(shop, article.productId)
+        : null;
     return {
       ok: true,
       intent,
       live: article.status === "approved",
       findingsChanged: result.findingsChanged,
+      cartWarning,
     };
+  }
+
+  if (intent === "saveFocus") {
+    if (article.sourceKind === "brief") {
+      return { ok: false, intent, error: "Edit the brief to change a brief page's focus." };
+    }
+    const focusTerm = String(formData.get("focusTerm") ?? "").trim();
+    const focusFacts = String(formData.get("focusFacts") ?? "").trim();
+    if (focusTerm.length > MAX_FOCUS_CHARS) {
+      return { ok: false, intent, error: `Keep the focus under ${MAX_FOCUS_CHARS} characters.` };
+    }
+    if (focusFacts.length > MAX_FOCUS_FACTS_CHARS) {
+      return { ok: false, intent, error: "The facts about the focus are too long." };
+    }
+    // Takes effect at the next regeneration, like a mode change.
+    await prisma.article.update({
+      where: { id: article.id },
+      data: { focusTerm: focusTerm || null, focusFacts: focusFacts || null },
+    });
+    return { ok: true, intent, error: null };
+  }
+
+  if (intent === "syncCart") {
+    const warning = await syncCartTitlesForProduct(shop, article.productId);
+    return { ok: warning === null, intent, error: warning };
   }
 
   if (intent === "refine") {
@@ -821,6 +904,17 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
       advancedRaw[key] = String(formData.get(`advanced_${key}`) ?? "").slice(0, 2000);
     }
     const advanced = normalizeBriefAdvanced(advancedRaw);
+    // Ingredient focus switch: the brief's mode, applied by the next start
+    // over (a refinement keeps following the mode the copy was made in).
+    const focusEnabled = String(formData.get("focusEnabled") ?? "") === "true";
+    const focusTerm = String(formData.get("focusTerm") ?? "").trim();
+    const focusFacts = String(formData.get("focusFacts") ?? "").trim();
+    if (focusEnabled && !focusTerm) {
+      return { ok: false, intent, error: "Type the ingredient or concern the page should focus on." };
+    }
+    if (focusTerm.length > MAX_FOCUS_CHARS || focusFacts.length > MAX_FOCUS_FACTS_CHARS) {
+      return { ok: false, intent, error: "The focus or its facts are too long." };
+    }
     await prisma.article.update({
       where: { id: article.id },
       data: {
@@ -829,6 +923,9 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         briefReferences: references || null,
         briefAdvanced:
           Object.keys(advanced).length > 0 ? JSON.stringify(advanced) : null,
+        mode: focusEnabled ? "focus" : "standard",
+        focusTerm: focusEnabled ? focusTerm : null,
+        focusFacts: focusEnabled ? focusFacts || null : null,
       },
     });
     return { ok: true, intent, error: null };
@@ -851,6 +948,11 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
         intent,
         error: error instanceof Error ? error.message : "Could not restore that version.",
       };
+    }
+    // The restored product name must reach the basket too.
+    if (article.generatedMode === "focus") {
+      const cartWarning = await syncCartTitlesForProduct(shop, article.productId);
+      if (cartWarning) notice = notice ? `${notice} ${cartWarning}` : cartWarning;
     }
     return { ok: true, intent, error: null, restored: number, notice };
   }
@@ -1062,6 +1164,9 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     if (published.count === 0) {
       return { ok: false, intent, error: "Only offline variants can be put live." };
     }
+    if (article.generatedMode === "focus") {
+      await syncCartTitlesForProduct(shop, article.productId);
+    }
     return { ok: true, intent, error: null };
   }
 
@@ -1086,11 +1191,19 @@ export const action = async ({ request, params }: ActionFunctionArgs) => {
     if (updated.count === 0) {
       return { ok: false, intent, error: "Only live variants can be taken offline." };
     }
+    // Taking a focus page offline removes its basket name too.
+    if (article.generatedMode === "focus") {
+      await syncCartTitlesForProduct(shop, article.productId);
+    }
     return { ok: true, intent, error: null };
   }
 
   if (intent === "delete") {
+    const { productId, generatedMode } = article;
     await prisma.article.delete({ where: { id: article.id } });
+    if (generatedMode === "focus") {
+      await syncCartTitlesForProduct(shop, productId);
+    }
     return redirect("/app");
   }
 
@@ -1148,6 +1261,8 @@ export default function ArticleReview() {
     conversionPlan,
     v2Plan,
     subtlePlan,
+    focusPlan,
+    basketRename,
     overrides,
     illustration,
     versions,
@@ -1162,6 +1277,8 @@ export default function ArticleReview() {
   const modeFetcher = useFetcher<typeof action>();
   const refineFetcher = useFetcher<typeof action>();
   const briefFetcher = useFetcher<typeof action>();
+  const focusFetcher = useFetcher<typeof action>();
+  const cartFetcher = useFetcher<typeof action>();
   const restoreFetcher = useFetcher<typeof action>();
   const duplicateFetcher = useFetcher<typeof action>();
   const [deleteModalOpen, setDeleteModalOpen] = useState(false);
@@ -1170,6 +1287,11 @@ export default function ArticleReview() {
   const [briefEditing, setBriefEditing] = useState(false);
 
   const isBrief = article.sourceKind === "brief";
+  // Ingredient focus: the mode set for the NEXT generation, and the mode
+  // the stored (possibly live) copy was generated under.
+  const isFocus = article.mode === "focus";
+  const wasFocusGenerated = article.generatedMode === "focus";
+  const titleOverride = overrides.find((o) => o.surfaceKey === TITLE_SURFACE_KEY);
 
   const makeBriefDraft = useCallback(
     () => ({
@@ -1181,10 +1303,21 @@ export default function ArticleReview() {
       tone: article.briefAdvanced.tone ?? "",
       mustSay: article.briefAdvanced.mustSay ?? "",
       mustAvoid: article.briefAdvanced.mustAvoid ?? "",
+      focusEnabled: article.mode === "focus",
+      focusTerm: article.focusTerm ?? "",
+      focusFacts: article.focusFacts ?? "",
     }),
     [article],
   );
   const [briefDraft, setBriefDraft] = useState(makeBriefDraft);
+
+  // Article pages in Ingredient focus mode: the focus and facts are edited
+  // on the focus card and apply at the next regeneration.
+  const [focusDraft, setFocusDraft] = useState({
+    term: article.focusTerm ?? "",
+    facts: article.focusFacts ?? "",
+  });
+  const [focusEditing, setFocusEditing] = useState(false);
 
   // Busy either from this tab (enqueue request in flight) or from the
   // server-side queue/lock reported by the loader.
@@ -1306,8 +1439,32 @@ export default function ArticleReview() {
             : "Edits saved — live on the storefront within ~2 minutes"
           : "Edits saved",
       );
+      const cartWarning =
+        "cartWarning" in saveFetcher.data ? saveFetcher.data.cartWarning : null;
+      if (cartWarning) shopify.toast.show(String(cartWarning), { isError: true });
     }
   }, [saveFetcher.state, saveFetcher.data, shopify]);
+
+  useEffect(() => {
+    if (focusFetcher.state === "idle" && focusFetcher.data?.intent === "saveFocus") {
+      if (!focusFetcher.data.ok && "error" in focusFetcher.data) {
+        shopify.toast.show(String(focusFetcher.data.error), { isError: true });
+      } else {
+        setFocusEditing(false);
+        shopify.toast.show("Focus saved — it applies when you regenerate.");
+      }
+    }
+  }, [focusFetcher.state, focusFetcher.data, shopify]);
+
+  useEffect(() => {
+    if (cartFetcher.state === "idle" && cartFetcher.data?.intent === "syncCart") {
+      if (!cartFetcher.data.ok && "error" in cartFetcher.data && cartFetcher.data.error) {
+        shopify.toast.show(String(cartFetcher.data.error), { isError: true });
+      } else {
+        shopify.toast.show("Basket name updated");
+      }
+    }
+  }, [cartFetcher.state, cartFetcher.data, shopify]);
 
   useEffect(() => {
     if (
@@ -1340,7 +1497,9 @@ export default function ArticleReview() {
                   ? "Ultra Custom V2"
                   : modeFetcher.data.mode === "subtle"
                     ? "Subtle intent"
-                    : "Standard";
+                    : modeFetcher.data.mode === "focus"
+                      ? "Ingredient focus"
+                      : "Standard";
       shopify.toast.show(
         `Mode set to ${label} — takes effect when you regenerate`,
       );
@@ -1442,10 +1601,20 @@ export default function ArticleReview() {
         advanced_tone: briefDraft.tone,
         advanced_mustSay: briefDraft.mustSay,
         advanced_mustAvoid: briefDraft.mustAvoid,
+        focusEnabled: String(briefDraft.focusEnabled),
+        focusTerm: briefDraft.focusTerm,
+        focusFacts: briefDraft.focusFacts,
       },
       { method: "POST" },
     );
   }, [briefDraft, briefFetcher]);
+
+  const handleSaveFocus = useCallback(() => {
+    focusFetcher.submit(
+      { intent: "saveFocus", focusTerm: focusDraft.term, focusFacts: focusDraft.facts },
+      { method: "POST" },
+    );
+  }, [focusDraft, focusFetcher]);
 
   const handleGenerate = useCallback(() => {
     generateFetcher.submit({ intent: "generate" }, { method: "POST" });
@@ -1529,6 +1698,11 @@ export default function ArticleReview() {
             <Badge tone="magic">Conversion Max</Badge>
           )}
           {article.mode === "v2" && <Badge tone="magic">Ultra V2</Badge>}
+          {isFocus && <Badge tone="magic">Ingredient focus</Badge>}
+          {(isFocus || wasFocusGenerated) &&
+            (article.focusTerm || focusPlan?.focus) && (
+              <Badge>{`Focus: ${article.focusTerm || focusPlan?.focus}`}</Badge>
+            )}
         </InlineStack>
       }
       secondaryActions={[
@@ -1557,7 +1731,7 @@ export default function ArticleReview() {
       ]}
       actionGroups={isBrief ? undefined : [
         {
-          title: `Mode: ${article.mode === "meta" ? "Meta" : article.mode === "ultra" ? "Ultra" : article.mode === "persona" ? "Persona" : article.mode === "max" ? "Max" : article.mode === "v2" ? "V2" : article.mode === "subtle" ? "Subtle" : "Standard"}`,
+          title: `Mode: ${article.mode === "meta" ? "Meta" : article.mode === "ultra" ? "Ultra" : article.mode === "persona" ? "Persona" : article.mode === "max" ? "Max" : article.mode === "v2" ? "V2" : article.mode === "subtle" ? "Subtle" : article.mode === "focus" ? "Ingredient focus" : "Standard"}`,
           actions: (
             [
               "standard",
@@ -1567,6 +1741,7 @@ export default function ArticleReview() {
               "persona",
               "max",
               "v2",
+              "focus",
             ] as const
           ).map((m) => ({
             content:
@@ -1582,7 +1757,9 @@ export default function ArticleReview() {
                         ? "Ultra deep persona"
                         : m === "max"
                           ? "Ultra Custom Conversion Max"
-                          : "Ultra Custom V2",
+                          : m === "focus"
+                            ? "Ingredient focus"
+                            : "Ultra Custom V2",
             disabled:
               article.mode === m ||
               isGenerating ||
@@ -1839,6 +2016,200 @@ export default function ArticleReview() {
               </Banner>
             )}
 
+            {(isFocus || wasFocusGenerated) && (
+              <Card>
+                <BlockStack gap="300">
+                  <InlineStack align="space-between" blockAlign="center">
+                    <Text as="h2" variant="headingMd">
+                      Ingredient focus
+                    </Text>
+                    {!isBrief && !focusEditing && (
+                      <Button
+                        size="slim"
+                        onClick={() => {
+                          setFocusDraft({
+                            term: article.focusTerm ?? "",
+                            facts: article.focusFacts ?? "",
+                          });
+                          setFocusEditing(true);
+                        }}
+                        disabled={isGenerating}
+                      >
+                        Edit focus
+                      </Button>
+                    )}
+                  </InlineStack>
+                  {!isFocus && wasFocusGenerated && (
+                    <Banner tone="warning">
+                      The live copy was generated in Ingredient focus mode,
+                      but the mode for the next generation is now different:
+                      regenerating will drop the product name and the
+                      repositioning.
+                    </Banner>
+                  )}
+                  {isFocus && !wasFocusGenerated && (
+                    <Text as="p" variant="bodySm" tone="subdued">
+                      {isBrief
+                        ? "Start over to apply the focus to this page."
+                        : "Regenerate to apply the focus to this page."}
+                    </Text>
+                  )}
+                  {focusEditing ? (
+                    <BlockStack gap="300">
+                      <TextField
+                        label="Focus (ingredient or concern)"
+                        value={focusDraft.term}
+                        onChange={(value) => setFocusDraft((d) => ({ ...d, term: value }))}
+                        autoComplete="off"
+                        placeholder="e.g. Vitamin C, or skin brightening"
+                        maxLength={MAX_FOCUS_CHARS}
+                        helpText="Leave blank to let the AI pick the focus from the article."
+                      />
+                      <TextField
+                        label="Facts about this focus (optional)"
+                        value={focusDraft.facts}
+                        onChange={(value) => setFocusDraft((d) => ({ ...d, facts: value }))}
+                        multiline={4}
+                        autoComplete="off"
+                        maxLength={MAX_FOCUS_FACTS_CHARS}
+                      />
+                      <InlineStack gap="200" align="end">
+                        <Button onClick={() => setFocusEditing(false)}>Cancel</Button>
+                        <Button
+                          variant="primary"
+                          loading={focusFetcher.state !== "idle"}
+                          onClick={handleSaveFocus}
+                        >
+                          Save focus
+                        </Button>
+                      </InlineStack>
+                    </BlockStack>
+                  ) : (
+                    <BlockStack gap="200">
+                      <Text as="p" variant="bodyMd">
+                        <Text as="span" fontWeight="semibold">
+                          Focus:{" "}
+                        </Text>
+                        {article.focusTerm ||
+                          (focusPlan?.focus
+                            ? `${focusPlan.focus} (inferred by the AI)`
+                            : isBrief
+                              ? "(none yet)"
+                              : "inferred from the article at generation")}
+                        {focusPlan?.focusKind && (article.focusTerm || focusPlan.focus)
+                          ? ` · ${focusPlan.focusKind}`
+                          : ""}
+                      </Text>
+                      {article.focusFacts && (
+                        <BlockStack gap="050">
+                          <Text as="h3" variant="headingSm" tone="subdued">
+                            Facts about the focus
+                          </Text>
+                          <div style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+                            {article.focusFacts}
+                          </div>
+                        </BlockStack>
+                      )}
+                    </BlockStack>
+                  )}
+                  {wasFocusGenerated && titleOverride && (
+                    <InlineGrid columns={{ xs: 1, md: 2 }} gap="300">
+                      <BlockStack gap="050">
+                        <Text as="h3" variant="headingSm" tone="subdued">
+                          New product name
+                        </Text>
+                        <Text as="p" variant="headingLg">
+                          {titleOverride.adapted}
+                        </Text>
+                      </BlockStack>
+                      <BlockStack gap="050">
+                        <Text as="h3" variant="headingSm" tone="subdued">
+                          Original name
+                        </Text>
+                        <Text as="p" variant="headingMd" tone="subdued">
+                          {titleOverride.original}
+                        </Text>
+                      </BlockStack>
+                    </InlineGrid>
+                  )}
+                  {wasFocusGenerated && titleOverride && (
+                    <Banner
+                      tone={
+                        article.cartSyncError
+                          ? "critical"
+                          : basketRename.active && titleOverride.enabled && isLive
+                            ? "success"
+                            : "warning"
+                      }
+                      title="Basket name"
+                    >
+                      <BlockStack gap="150">
+                        <Text as="p">
+                          {article.cartSyncError
+                            ? article.cartSyncError
+                            : !basketRename.active
+                              ? `The basket keeps the original name: ${basketRename.reason}`
+                              : !titleOverride.enabled
+                                ? "The product name surface is unticked on this page, so the heading and the basket keep the original name."
+                                : !isLive
+                                  ? "The page is not live, so nothing is renamed in the basket."
+                                  : `Items added from this page show in the basket, the checkout and the order as "${titleOverride.adapted}" (with a hidden staff note carrying the original name).`}
+                        </Text>
+                        {article.cartSyncError && (
+                          <div>
+                            <Button
+                              size="slim"
+                              loading={cartFetcher.state !== "idle"}
+                              onClick={() =>
+                                cartFetcher.submit({ intent: "syncCart" }, { method: "POST" })
+                              }
+                            >
+                              Retry
+                            </Button>
+                          </div>
+                        )}
+                      </BlockStack>
+                    </Banner>
+                  )}
+                  {focusPlan?.rationale && (
+                    <BlockStack gap="050">
+                      <Text as="h3" variant="headingSm" tone="subdued">
+                        What the generation did
+                      </Text>
+                      <Text as="p" variant="bodyMd">
+                        {focusPlan.rationale}
+                      </Text>
+                    </BlockStack>
+                  )}
+                  {focusPlan && focusPlan.dropped.length > 0 && (
+                    <BlockStack gap="150">
+                      <Text as="h3" variant="headingSm" tone="subdued">
+                        Removed from the page
+                      </Text>
+                      <List type="bullet">
+                        {focusPlan.dropped.map((item, index) => (
+                          <List.Item key={index}>
+                            <Text as="span" fontWeight="semibold">
+                              {item.point}
+                            </Text>
+                            {item.detail ? ` - ${item.detail}` : ""}
+                          </List.Item>
+                        ))}
+                      </List>
+                    </BlockStack>
+                  )}
+                  {wasFocusGenerated && (
+                    <Text as="p" variant="bodySm" tone="subdued">
+                      The AI may have added facts beyond the sources, product
+                      facts included: every section lists them under Added
+                      facts to verify. Nothing checked that the product
+                      contains the focus ingredient.
+                    </Text>
+                  )}
+                </BlockStack>
+              </Card>
+            )}
+
             {isBrief ? (
               <Card>
                 <BlockStack gap="300">
@@ -1899,6 +2270,39 @@ export default function ArticleReview() {
                           maxLength={2000}
                         />
                       ))}
+                      <Checkbox
+                        label="Reposition around one ingredient or concern (renames the product on the page and in the basket)"
+                        checked={briefDraft.focusEnabled}
+                        onChange={(value) =>
+                          setBriefDraft((d) => ({ ...d, focusEnabled: value }))
+                        }
+                        helpText="Ingredient focus. Switching it on or off takes effect when you start over."
+                      />
+                      {briefDraft.focusEnabled && (
+                        <>
+                          <TextField
+                            label="Focus (ingredient or concern)"
+                            value={briefDraft.focusTerm}
+                            onChange={(value) =>
+                              setBriefDraft((d) => ({ ...d, focusTerm: value }))
+                            }
+                            autoComplete="off"
+                            placeholder="e.g. Vitamin C, or skin brightening"
+                            maxLength={MAX_FOCUS_CHARS}
+                            requiredIndicator
+                          />
+                          <TextField
+                            label="Facts about this focus (optional)"
+                            value={briefDraft.focusFacts}
+                            onChange={(value) =>
+                              setBriefDraft((d) => ({ ...d, focusFacts: value }))
+                            }
+                            multiline={4}
+                            autoComplete="off"
+                            maxLength={MAX_FOCUS_FACTS_CHARS}
+                          />
+                        </>
+                      )}
                       <Text as="p" variant="bodySm" tone="subdued">
                         Saving the brief changes nothing on the page by itself:
                         it applies to the next refinement, or when you start
@@ -2051,6 +2455,23 @@ export default function ArticleReview() {
                 left open, and moderately tightens the page for nearly-sold
                 readers. The four inventories appear here for review once it
                 goes live. No study results or rankings are pulled.
+              </Banner>
+            )}
+
+            {isFocus && article.status === "pending" && (
+              <Banner tone="info" title="Ingredient focus page">
+                Generation will reposition the whole page, product name
+                included, around one ingredient or concern
+                {article.focusTerm
+                  ? ` (${article.focusTerm})`
+                  : isBrief
+                    ? ""
+                    : " inferred from the article"}
+                : the focus leads every section, other ingredients may be
+                dropped, and the AI may add facts beyond the sources - each
+                one is listed here under Added facts to verify once the page
+                is live. With the basket rename active, the new name follows
+                the item into the basket and the order.
               </Banner>
             )}
 
@@ -2398,7 +2819,7 @@ export default function ArticleReview() {
                   <BlockStack gap="300">
                     <InlineStack align="space-between" blockAlign="center">
                       <Text as="h2" variant="headingMd">
-                        {o.label}
+                        {o.surfaceKey === TITLE_SURFACE_KEY ? "Product name" : o.label}
                       </Text>
                       <Checkbox
                         label="Include this surface"
@@ -2408,6 +2829,13 @@ export default function ArticleReview() {
                         }
                       />
                     </InlineStack>
+                    {o.surfaceKey === TITLE_SURFACE_KEY && (
+                      <Text as="p" variant="bodySm" tone="subdued">
+                        One line, shown as the page heading and, with the
+                        basket rename, in the basket and the order. Keep the
+                        brand and the product type.
+                      </Text>
+                    )}
                     {o.warnings.length > 0 && (
                       <Banner tone="warning" title="Flagged for review">
                         <List type="bullet">
@@ -2418,17 +2846,50 @@ export default function ArticleReview() {
                       </Banner>
                     )}
                     {o.unverifiedClaims.length > 0 && (
-                      <Banner tone="info" title="Unverified claims">
+                      <Banner
+                        tone={
+                          wasFocusGenerated &&
+                          o.unverifiedClaims.some((c) => c.startsWith("Product fact:"))
+                            ? "warning"
+                            : "info"
+                        }
+                        title={wasFocusGenerated ? "Added facts to verify" : "Unverified claims"}
+                      >
                         <BlockStack gap="150">
                           <List type="bullet">
-                            {o.unverifiedClaims.map((claim, index) => (
-                              <List.Item key={index}>{claim}</List.Item>
-                            ))}
+                            {[...o.unverifiedClaims]
+                              .sort((a, b) => {
+                                // Product facts first: an invented
+                                // concentration matters more than a general
+                                // statement about the ingredient.
+                                const pa = a.startsWith("Product fact:") ? 0 : 1;
+                                const pb = b.startsWith("Product fact:") ? 0 : 1;
+                                return pa - pb;
+                              })
+                              .map((claim, index) => (
+                                <List.Item key={index}>
+                                  {claim.startsWith("Product fact:") ? (
+                                    <>
+                                      <Badge tone="critical">Product fact</Badge>{" "}
+                                      {claim.slice("Product fact:".length).trim()}
+                                    </>
+                                  ) : claim.startsWith("General:") ? (
+                                    <>
+                                      <Badge>General</Badge>{" "}
+                                      {claim.slice("General:".length).trim()}
+                                    </>
+                                  ) : (
+                                    claim
+                                  )}
+                                </List.Item>
+                              ))}
                           </List>
                           <Text as="p" variant="bodySm">
-                            {isBrief
-                              ? "The checker found these in neither the page copy, the brief, nor the references. Check each one before marking the page reviewed; edit or refine the copy if anything does not hold up."
-                              : "The checker found these in neither the page copy nor the article. Check each one before marking the page reviewed."}
+                            {wasFocusGenerated
+                              ? "This page may state facts beyond the page copy, the sources and the facts you supplied - on purpose. Product facts (what is in the bottle: a concentration, a texture, a pH) can simply be wrong: check them first, then the general ones; edit the copy or take the page offline if anything does not hold up."
+                              : isBrief
+                                ? "The checker found these in neither the page copy, the brief, nor the references. Check each one before marking the page reviewed; edit or refine the copy if anything does not hold up."
+                                : "The checker found these in neither the page copy nor the article. Check each one before marking the page reviewed."}
                             {o.unverifiedClaims.some((c) => c.startsWith(FIGURE_CLAIM_PREFIX))
                               ? ' Items marked "Illustration:" come from the figure\'s caption, alt text and drawing prompt; a chart may show illustrative numbers, which the checker lists here on purpose.'
                               : ""}
@@ -2480,12 +2941,15 @@ export default function ArticleReview() {
                         </div>
                       </BlockStack>
                       <TextField
-                        label="Adapted"
+                        label={o.surfaceKey === TITLE_SURFACE_KEY ? "New product name" : "Adapted"}
                         value={draft.adapted}
                         onChange={(value) =>
                           updateDraft(o.id, { adapted: value })
                         }
-                        multiline={12}
+                        multiline={o.surfaceKey === TITLE_SURFACE_KEY ? undefined : 12}
+                        maxLength={
+                          o.surfaceKey === TITLE_SURFACE_KEY ? PRODUCT_NAME_MAX_CHARS : undefined
+                        }
                         autoComplete="off"
                       />
                     </InlineGrid>
@@ -2587,7 +3051,9 @@ export default function ArticleReview() {
                     >
                       {hasUnsavedEdits
                         ? "Save your edits first: a refinement works on the saved copy and would discard unsaved typing."
-                        : "Only what you ask for changes; everything else stays as it is, hand edits included. The new copy goes live within about 2 minutes and comes back as “Live — review needed”."}
+                        : wasFocusGenerated
+                          ? "Only what you ask for changes; everything else stays as it is, hand edits included. You can also rename the product here (“call it Vitamin C Glow Serum”); the basket name follows. The new copy goes live within about 2 minutes and comes back as “Live — review needed”."
+                          : "Only what you ask for changes; everything else stays as it is, hand edits included. The new copy goes live within about 2 minutes and comes back as “Live — review needed”."}
                     </Text>
                     <Button
                       variant="primary"

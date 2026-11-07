@@ -1,0 +1,26 @@
+# Page Tailor basket rename: a Cart Transform function that shows an
+# Ingredient focus page's product name on basket lines added from that page.
+# `uid` is written by the Shopify CLI on the first `npm run deploy` (never
+# re-scaffold this extension or rename its handle afterwards: the merchant's
+# activated cart transform points at this function).
+api_version = "2026-04"
+
+[[extensions]]
+name = "Page Tailor basket rename"
+handle = "cart-rename"
+type = "function"
+description = "Shows a Page Tailor Ingredient focus page's product name on basket lines added from that page (Shopify Plus)."
+
+  [[extensions.targeting]]
+  target = "cart.transform.run"
+  input_query = "src/run.graphql"
+  export = "run"
+
+  [extensions.build]
+  command = ""
+  path = "dist/function.wasm"
+  watch = ["src/**/*.js"]
+  # The run function is plain JavaScript with JSDoc comments: no generated
+  # GraphQL types are needed, so the CLI's typegen step is a no-op (it would
+  # otherwise need a schema.graphql fetched with `shopify app function schema`).
+  typegen_command = "echo Page Tailor basket rename: no GraphQL typegen needed"

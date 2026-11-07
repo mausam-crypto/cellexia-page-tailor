@@ -23,15 +23,31 @@ automatically_update_urls_on_dev = true
 redirect_urls = ["https://cellexia-page-tailor.onrender.com/auth/callback"]
 
 [access_scopes]
-# read_products      -> product copy + metafields (Accentuate fields are plain metafields)
-# read_translations  -> localized copy managed by Translate & Adapt
-# read_locales       -> published shop locales and URL prefixes
-# read_orders        -> experiment metrics (orders/AOV/revenue for baseline vs treatment)
-# write_files        -> illustrations are stored in the store's Files (Shopify CDN)
-# The app never writes to products, metafields or translations: variants
-# live in the app database only; the only thing it writes to the store is
-# image files for illustrations.
-scopes = "read_products,read_translations,read_locales,read_orders,write_files"
+# write_products       -> product copy + metafields to read (Accentuate fields are
+#                         plain metafields; includes read_products), and ONE
+#                         app-owned, storefront-invisible product metafield the
+#                         app writes: the basket name map of Ingredient focus
+#                         pages (see [product.metafields.app.cart_titles] below)
+# read_translations    -> localized copy managed by Translate & Adapt
+# read_locales         -> published shop locales and URL prefixes
+# read_orders          -> experiment metrics (orders/AOV/revenue for baseline vs treatment)
+# write_files          -> illustrations are stored in the store's Files (Shopify CDN)
+# write_cart_transforms -> the basket rename (a Cart Transform function the
+#                         merchant activates in Settings; Shopify Plus)
+# The app never edits product content, translations or orders: variants
+# live in the app database only. It writes image files for illustrations
+# and the app-owned basket name metafield, nothing else.
+scopes = "write_products,read_translations,read_locales,read_orders,write_files,write_cart_transforms"
+
+# App-owned product metafield holding the basket name map: variant code ->
+# product name for every live Ingredient focus page of the product. Read by
+# the cart-rename function; read-only on the product page in the admin.
+[product.metafields.app.cart_titles]
+name = "Page Tailor basket titles"
+description = "Variant code to basket title map for live Ingredient focus pages. Managed by Page Tailor; do not edit."
+type = "json"
+access.admin = "merchant_read"
+access.storefront = "none"
 
 # Storefront requests to /apps/cx/* are proxied to this app at /proxy/*.
 # The Shopify CLI rewrites `url` automatically during `shopify app dev`.

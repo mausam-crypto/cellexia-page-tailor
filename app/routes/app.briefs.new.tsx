@@ -12,6 +12,7 @@ import {
   BlockStack,
   Button,
   Card,
+  Checkbox,
   ChoiceList,
   Collapsible,
   Divider,
@@ -59,6 +60,8 @@ const MAX_NAME_CHARS = 120;
 const MAX_BRIEF_CHARS = 20_000;
 const MAX_REFERENCES_CHARS = 60_000;
 const MAX_ADVANCED_CHARS = 2_000;
+const MAX_FOCUS_CHARS = 120;
+const MAX_FOCUS_FACTS_CHARS = 20_000;
 // Not a limit: above this many variants in one submit the form warns that
 // the uncapped background queue will start them all at once.
 const SOFT_VARIANT_CAP = 20;
@@ -68,6 +71,8 @@ type BriefInput = {
   text: string;
   references: string;
   advanced: BriefAdvanced;
+  /** Ingredient focus: the focus and optional facts; null = standard brief. */
+  focus: { term: string; facts: string } | null;
   /** Raw illustration choices per surface; validated against the shop later. */
   illustrations: unknown;
 };
@@ -114,7 +119,31 @@ function normalizeBriefInput(raw: string): { briefs: BriefInput[]; error: string
         return { briefs: [], error: `"${label}" for "${name}" is too long (max ${MAX_ADVANCED_CHARS.toLocaleString("en-US")} characters).` };
       }
     }
-    briefs.push({ name, text, references, advanced, illustrations: r.illustrations });
+    // Ingredient focus: the switch needs a focus; facts are optional.
+    const focusRaw = (typeof r.focus === "object" && r.focus !== null ? r.focus : {}) as Record<
+      string,
+      unknown
+    >;
+    const focusEnabled = focusRaw.enabled === true || focusRaw.enabled === "true";
+    const focusTerm = String(focusRaw.term ?? "").trim();
+    const focusFacts = String(focusRaw.facts ?? "").trim();
+    if (focusEnabled && !focusTerm) {
+      return { briefs: [], error: `"${name}" repositions the product around a focus, but no focus is given. Type the ingredient or concern.` };
+    }
+    if (focusTerm.length > MAX_FOCUS_CHARS) {
+      return { briefs: [], error: `Keep the focus of "${name}" under ${MAX_FOCUS_CHARS} characters.` };
+    }
+    if (focusFacts.length > MAX_FOCUS_FACTS_CHARS) {
+      return { briefs: [], error: `The facts about the focus of "${name}" are too long (max ${MAX_FOCUS_FACTS_CHARS.toLocaleString("en-US")} characters).` };
+    }
+    briefs.push({
+      name,
+      text,
+      references,
+      advanced,
+      focus: focusEnabled ? { term: focusTerm, facts: focusFacts } : null,
+      illustrations: r.illustrations,
+    });
   }
   if (briefs.length === 0) {
     return { briefs: [], error: "Add at least one brief with a name and text." };
@@ -133,8 +162,18 @@ function composeBriefText(brief: {
   tone: string;
   mustSay: string;
   mustAvoid: string;
+  focusEnabled: boolean;
+  focusTerm: string;
+  focusFacts: string;
 }): string {
   const extras = [
+    [
+      "Focus",
+      brief.focusEnabled && brief.focusTerm.trim()
+        ? `this page positions the product around ${brief.focusTerm.trim()} (every illustration should be about it)`
+        : "",
+    ],
+    ["Facts about the focus", brief.focusEnabled ? brief.focusFacts : ""],
     ["Audience", brief.audience],
     ["Key message", brief.keyMessage],
     ["Tone", brief.tone],
@@ -236,6 +275,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       text: brief.text,
       references: brief.references,
       advanced: brief.advanced,
+      focus: brief.focus,
       illustrationPlan: Object.keys(plan).length > 0 ? JSON.stringify(plan) : null,
     });
   }
@@ -289,6 +329,10 @@ type BriefDraft = {
   tone: string;
   mustSay: string;
   mustAvoid: string;
+  /** Ingredient focus switch + focus + optional facts. */
+  focusEnabled: boolean;
+  focusTerm: string;
+  focusFacts: string;
   illustrations: Record<string, IllustrationChoiceDraft>;
 };
 
@@ -306,6 +350,9 @@ function newDraft(illustrations: Record<string, IllustrationChoiceDraft>): Brief
     tone: "",
     mustSay: "",
     mustAvoid: "",
+    focusEnabled: false,
+    focusTerm: "",
+    focusFacts: "",
     illustrations,
   };
 }
@@ -411,6 +458,13 @@ export default function NewBriefs() {
       setClientError("Every brief needs both a name and the brief text.");
       return;
     }
+    const focusMissing = filledBriefs.find((b) => b.focusEnabled && !b.focusTerm.trim());
+    if (focusMissing) {
+      setClientError(
+        `"${focusMissing.name.trim() || "A brief"}" repositions the product around a focus: type the ingredient or concern.`,
+      );
+      return;
+    }
     if (filledBriefs.length === 0) {
       setClientError("Add at least one brief.");
       return;
@@ -432,6 +486,11 @@ export default function NewBriefs() {
               tone: b.tone,
               mustSay: b.mustSay,
               mustAvoid: b.mustAvoid,
+            },
+            focus: {
+              enabled: b.focusEnabled,
+              term: b.focusTerm,
+              facts: b.focusFacts,
             },
             illustrations: Object.fromEntries(
               Object.entries(b.illustrations).map(([k, d]) => [k, choiceToSubmission(d)]),
@@ -568,6 +627,36 @@ export default function NewBriefs() {
                     }
                     helpText="Material the page may draw on: pasted text and/or one link per line (links are read when the page is generated). Pasting the ad itself lets the page echo the ad's wording."
                   />
+                  <BlockStack gap="300">
+                    <Checkbox
+                      label="Reposition around one ingredient or concern (renames the product on the page and in the basket)"
+                      checked={brief.focusEnabled}
+                      onChange={(value) => updateBrief(brief.key, { focusEnabled: value })}
+                      helpText="Ingredient focus: the page reads as THE product for this focus - a vitamin C serum, a brightening treatment. The product name keeps the brand and the product type and gets the focus as its descriptor; every section leads with the focus; other ingredients may be dropped; the AI may add facts beyond the brief, all listed on the review page under Added facts to verify."
+                    />
+                    {brief.focusEnabled && (
+                      <>
+                        <TextField
+                          label="Focus (ingredient or concern)"
+                          value={brief.focusTerm}
+                          onChange={(value) => updateBrief(brief.key, { focusTerm: value })}
+                          autoComplete="off"
+                          placeholder="e.g. Vitamin C, or skin brightening"
+                          maxLength={MAX_FOCUS_CHARS}
+                          requiredIndicator
+                        />
+                        <TextField
+                          label="Facts about this focus (optional)"
+                          value={brief.focusFacts}
+                          onChange={(value) => updateBrief(brief.key, { focusFacts: value })}
+                          multiline={4}
+                          autoComplete="off"
+                          placeholder="Approved claims, figures or background about the ingredient or concern the page may use."
+                          maxLength={MAX_FOCUS_FACTS_CHARS}
+                        />
+                      </>
+                    )}
+                  </BlockStack>
                   <Button
                     variant="plain"
                     disclosure={brief.advancedOpen ? "up" : "down"}

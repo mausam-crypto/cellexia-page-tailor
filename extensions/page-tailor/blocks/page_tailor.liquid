@@ -24,6 +24,7 @@
     var HIDE = {{ block.settings.hide_selectors | json }};
     var MAX_HOLD = {{ block.settings.max_hide_ms | json }};
     var PERSIST_DAYS = {{ block.settings.persist_days | default: 30 | json }};
+    var CART_FETCH_HOOK = {{ block.settings.cart_fetch_hook | default: false | json }};
     var LOCALE = {{ request.locale.iso_code | json }};
 
     /* Handles may be percent-encoded non-ASCII (CJK etc.). */
@@ -172,7 +173,168 @@
         var o = p.ops[k];
         if (!o || typeof o.selector !== 'string' || typeof o.content !== 'string') return false;
       }
+      /* Basket rename (Ingredient focus pages): optional, strictly shaped. */
+      if (p.cart !== undefined && p.cart !== null) {
+        if (typeof p.cart !== 'object' || typeof p.cart.code !== 'string' ||
+            !/^[a-z0-9]{4,16}$/.test(p.cart.code) ||
+            typeof p.cart.original_title !== 'string' || p.cart.original_title.length > 255) {
+          return false;
+        }
+      }
       return true;
+    }
+
+    /* Basket rename: tag THIS product's add-to-cart forms with the variant
+       code (the app's Cart Transform function renames the basket line) and
+       the original product name (a hidden staff note on the order). Only
+       forms whose variant id belongs to this product are tagged, so a
+       recommendation or quick-add form for another product is never
+       touched. Everything fails open: an untagged line keeps its name. */
+    var CX_KEY = 'properties[_cx]';
+    var ORIG_KEY = 'properties[_Original product]';
+    var cartTag = null;
+    var variantIds = null;
+    var variantIdsLoading = false;
+    var fetchHooked = false;
+    function collectVariantIds(product) {
+      var ids = {};
+      var variants = product && product.variants;
+      if (Object.prototype.toString.call(variants) === '[object Array]') {
+        for (var v = 0; v < variants.length; v++) {
+          if (variants[v] && variants[v].id !== undefined) ids[String(variants[v].id)] = 1;
+        }
+      }
+      return ids;
+    }
+    function loadVariantIds(done) {
+      if (variantIds) { done(); return; }
+      try {
+        var meta = window.ShopifyAnalytics && window.ShopifyAnalytics.meta &&
+          window.ShopifyAnalytics.meta.product;
+        if (meta && meta.variants && meta.variants.length) {
+          variantIds = collectVariantIds(meta);
+          done();
+          return;
+        }
+      } catch (e) {}
+      if (variantIdsLoading) return;
+      variantIdsLoading = true;
+      try {
+        var root = (window.Shopify && window.Shopify.routes && window.Shopify.routes.root) || '/';
+        fetch(root + 'products/' + encodeURIComponent(product) + '.js', { credentials: 'omit' })
+          .then(function (res) { return res.ok ? res.json() : null; })
+          .then(function (json) {
+            if (json) { variantIds = collectVariantIds(json); done(); }
+          })
+          .catch(function () {});
+      } catch (e) {}
+    }
+    function setHidden(form, name, value) {
+      var el = form.querySelector('input[name="' + name + '"]');
+      if (!el) {
+        el = document.createElement('input');
+        el.type = 'hidden';
+        el.name = name;
+        el.setAttribute('data-pt', '1');
+        form.appendChild(el);
+      }
+      el.value = value;
+    }
+    function tagForm(form) {
+      try {
+        if (!cartTag || !variantIds) return;
+        if (!/\/cart\/add/.test(form.getAttribute('action') || '')) return;
+        var idInput = form.querySelector('[name="id"]');
+        if (!idInput || !variantIds[String(idInput.value)]) return;
+        if (form.__ptCx === cartTag.code) return;
+        setHidden(form, CX_KEY, cartTag.code);
+        if (cartTag.original_title) setHidden(form, ORIG_KEY, cartTag.original_title);
+        form.__ptCx = cartTag.code;
+      } catch (e) {}
+    }
+    function tagCartForms() {
+      if (!cartTag) return;
+      loadVariantIds(function () {
+        try {
+          var forms = document.querySelectorAll('form[action*="/cart/add"]');
+          for (var i = 0; i < forms.length; i++) tagForm(forms[i]);
+        } catch (e) {}
+      });
+    }
+    /* Themes that post JSON to /cart/add.js (not a form) never carry hidden
+       inputs. Opt-in wrapper (theme setting): adds the two properties to
+       such requests for this product's variants only; anything unexpected
+       passes through untouched. Off by default: global fetch wrappers can
+       collide with other apps' wrappers. */
+    function hookCartFetch() {
+      if (fetchHooked || !CART_FETCH_HOOK || typeof window.fetch !== 'function') return;
+      fetchHooked = true;
+      var original = window.fetch;
+      window.fetch = function (input, init) {
+        try {
+          var url = typeof input === 'string' ? input : (input && input.url) || '';
+          if (cartTag && variantIds && /\/cart\/add(\.js)?(\?|$)/.test(url) && init && init.body) {
+            if (typeof init.body === 'string') {
+              var body = JSON.parse(init.body);
+              var items = body && body.items ? body.items : (body && body.id !== undefined ? [body] : null);
+              var touched = false;
+              if (items) {
+                for (var i = 0; i < items.length; i++) {
+                  var item = items[i];
+                  if (!item || !variantIds[String(item.id)]) continue;
+                  item.properties = item.properties || {};
+                  if (item.properties._cx === undefined) {
+                    item.properties._cx = cartTag.code;
+                    item.properties['_Original product'] = cartTag.original_title;
+                    touched = true;
+                  }
+                }
+              }
+              if (touched) init = Object.assign({}, init, { body: JSON.stringify(body) });
+            } else if (typeof FormData !== 'undefined' && init.body instanceof FormData) {
+              var fd = init.body;
+              if (!fd.has(CX_KEY) && variantIds[String(fd.get('id'))]) {
+                fd.append(CX_KEY, cartTag.code);
+                fd.append(ORIG_KEY, cartTag.original_title);
+              }
+            } else if (typeof URLSearchParams !== 'undefined' && init.body instanceof URLSearchParams) {
+              var sp = init.body;
+              if (!sp.has(CX_KEY) && variantIds[String(sp.get('id'))]) {
+                sp.append(CX_KEY, cartTag.code);
+                sp.append(ORIG_KEY, cartTag.original_title);
+              }
+            }
+          }
+        } catch (e) {}
+        return original.call(this, input, init);
+      };
+    }
+    var tagTimer = null;
+    function scheduleTag() {
+      if (!cartTag) return;
+      if (tagTimer) return;
+      tagTimer = setTimeout(function () { tagTimer = null; tagCartForms(); }, 50);
+    }
+    function armCartTagging(cart) {
+      cartTag = cart;
+      hookCartFetch();
+      tagCartForms();
+      try {
+        /* Themes re-render the product form (variant change, section
+           reload): re-tag whatever appears, coalesced. */
+        if (typeof MutationObserver !== 'undefined' && !document.__ptCartObserver) {
+          document.__ptCartObserver = new MutationObserver(scheduleTag);
+          document.__ptCartObserver.observe(document.body || document.documentElement, {
+            childList: true, subtree: true
+          });
+        }
+        if (!document.__ptCartSubmit) {
+          document.__ptCartSubmit = 1;
+          document.addEventListener('submit', function (ev) {
+            try { if (ev.target && ev.target.tagName === 'FORM') tagForm(ev.target); } catch (e) {}
+          }, true);
+        }
+      } catch (e) {}
     }
     function readCache() {
       try {
@@ -240,6 +402,10 @@
       /* Only mark applied when something actually swapped, so "served but
          zero selectors matched" is distinguishable when debugging a theme. */
       try { if (swapped > 0) document.documentElement.dataset.ptApplied = '1'; } catch (e) {}
+      /* Basket rename: the payload carries `cart` only while the page's
+         heading is renamed; reached by the cached, fresh and remembered
+         paths alike, so a return visit tags the form too. */
+      try { if (payload.cart) armCartTagging(payload.cart); } catch (e) {}
       release();
     }
     function schedule() {
@@ -335,6 +501,13 @@
       "step": 1,
       "default": 30,
       "info": "Returning visitors keep seeing the variant they last opened, for this many days, when they revisit the product page without the special link. 0 turns persistence off. Append ?cx=off to a product URL to reset your own browser (useful for QA)."
+    },
+    {
+      "type": "checkbox",
+      "id": "cart_fetch_hook",
+      "label": "Basket rename: also tag JSON add-to-cart requests",
+      "default": false,
+      "info": "Only for themes whose add-to-cart button sends JSON to /cart/add.js instead of submitting the product form. Leave off unless an Ingredient focus page's new name shows on the page but not in the basket."
     }
   ]
 }

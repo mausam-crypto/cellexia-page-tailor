@@ -206,6 +206,54 @@ Settings: drawing quality (default High, about 5 cents per image), an
 optional monthly budget (drawing pauses when reached), a house-style text
 added to every prompt, and the per-surface "Allow illustrations" switch.
 
+## Ingredient focus (single-ingredient pages)
+
+**Ingredient focus** is an adaptation mode that repositions the whole page,
+product name included, around ONE ingredient or concern: a four-active serum
+becomes "Cellexia Vitamin C Serum" for people searching for a vitamin C serum,
+a dark-spot corrector becomes a brightening treatment. Tailoring to the focus
+is the priority; the rest of the listing is kept where it does not get in
+the way.
+
+- **Where:** *Add articles* (a new entry in the Adaptation mode list; an
+  existing article page can be switched to it on its review page and
+  regenerated) and *Add briefs* (a per-brief switch "Reposition around one
+  ingredient or concern" with a **Focus** box; an existing brief page gets it
+  through *Edit brief* then *Start over*).
+- **The focus:** briefs type it ("Vitamin C", "skin brightening"); article
+  batches may leave it blank, and the AI picks the focus from each article
+  ("best vitamin C serums" becomes vitamin C) and shows it on the review
+  page. Both forms take optional **Facts about this focus** to paste
+  approved claims into.
+- **The product is renamed.** The AI writes a name around the focus, keeps
+  the brand and the product type, and translates it per language. It is a
+  new copy surface, **Product name**, with its own CSS selector in Settings
+  (used only by Ingredient focus pages); it shows first on the review page
+  next to the original and can be hand-edited or, on brief pages, changed
+  with Refine ("call it Vitamin C Glow Serum").
+- **Deep rewrite.** The focus leads every section, heading and list; other
+  ingredients and benefits become supporting detail or may be dropped. A
+  complete ingredients list stays verbatim, and the facts of usage, safety,
+  shipping and policy answers in the FAQ are kept. No new sections, images
+  or price changes.
+- **Facts are free, and disclosed.** The AI may draw on the page, the
+  article or brief, references, the pasted facts and general cosmetic
+  knowledge, and may add claims, figures and product-specific facts
+  beyond them. Every addition is listed per section under **Added facts to
+  verify**, product facts first. The pattern checks still flag; nothing
+  blocks (post-publication review, as for every page). **Nothing checks
+  that the product actually contains the focus ingredient.**
+- **Basket rename (Shopify Plus).** With the basket rename activated in
+  Settings, an item added to the basket from a focus page keeps the new
+  name in the basket, the checkout, the order and its emails, with a hidden
+  staff note carrying the original name. See [docs/setup.md](docs/setup.md)
+  §9 for the activation, the two new permissions and the store-side
+  template edits.
+
+Everything else carries over: version history, restore, duplicate,
+illustrations (the recommender is told the focus), dashboard filters and the
+CSV export.
+
 ## Experiment tracker
 
 Measures the impact of serving variants for one product + language by comparing
@@ -250,6 +298,8 @@ re-consent to the new scope.
 
 `SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`, and `SCOPES` are managed by the Shopify
 CLI during `npm run dev`; see [.env.example](.env.example) for manual/production
-setups. Scopes: `read_products`, `read_translations`, `read_locales`,
-`read_orders`, and `write_files` (illustrations are stored in the store's
-Files; the app writes nothing else to the store).
+setups. Scopes: `write_products` (product copy and metafields to read, plus
+the one app-owned basket name metafield the app writes for Ingredient focus
+pages), `read_translations`, `read_locales`, `read_orders`, `write_files`
+(illustrations are stored in the store's Files) and `write_cart_transforms`
+(the basket rename function). The app never edits product content.

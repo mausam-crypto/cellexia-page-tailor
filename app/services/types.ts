@@ -4,7 +4,12 @@
 // is read directly from the rendered storefront page - used for theme tab
 // panels (Overview/Benefits/Science) where heading and body live in one
 // container and must be adapted together.
-export type SurfaceSource = "description" | "metafield" | "page";
+// "title": the product name itself (Admin API product title, translated per
+// locale), a plain-text surface generated ONLY by Ingredient focus pages.
+export type SurfaceSource = "description" | "metafield" | "page" | "title";
+
+/** Surface key of the product-name surface (Ingredient focus pages). */
+export const TITLE_SURFACE_KEY = "title";
 
 export type AdaptationDepth = "light" | "medium" | "deep";
 
@@ -39,6 +44,14 @@ export type AdaptationDepth = "light" | "medium" | "deep";
  *   buying questions the article left open) drive a zero-dissonance,
  *   lead-with-the-delta rewrite with moderate stage-matched compression.
  *   Same posture as ultra: no proof elements, Google-safe.
+ * - focus: "Ingredient focus" - repositions the whole page, product name
+ *   included, around ONE ingredient or concern (typed, or inferred from the
+ *   article). Other ingredients are demoted or dropped; the product name
+ *   is a surface of its own (and, with the basket rename, follows the item
+ *   into the cart and the order). Facts are free: the model may add claims,
+ *   figures and product-specific facts beyond the sources; every addition
+ *   is listed per surface as unverifiedClaims for post-publication review.
+ *   The only mode available to brief rows besides "standard".
  */
 export type AdaptationMode =
   | "standard"
@@ -47,7 +60,8 @@ export type AdaptationMode =
   | "ultra"
   | "persona"
   | "max"
-  | "v2";
+  | "v2"
+  | "focus";
 
 export function normalizeAdaptationMode(value: string): AdaptationMode {
   return value === "subtle" ||
@@ -55,9 +69,62 @@ export function normalizeAdaptationMode(value: string): AdaptationMode {
     value === "ultra" ||
     value === "persona" ||
     value === "max" ||
-    value === "v2"
+    value === "v2" ||
+    value === "focus"
     ? value
     : "standard";
+}
+
+/** Ingredient focus mode: what the generation did, shown as the first card
+ *  of the review page. */
+export interface FocusPlan {
+  /** The ingredient or concern the page is built around. */
+  focus: string;
+  focusKind: "ingredient" | "concern";
+  /** Typed by the merchant, or inferred by the model from the article. */
+  focusSource: "typed" | "inferred";
+  /** The product name as stored in the title surface after generation. */
+  newTitle: string;
+  originalTitle: string;
+  /** 2-3 sentences: what was repositioned, what was added. */
+  rationale: string;
+  /** Every ingredient, benefit or claim the rewrite removed, with where
+   *  and why. */
+  dropped: Array<{ point: string; detail: string }>;
+}
+
+/** Parse a stored FocusPlan; anything malformed yields null. */
+export function parseFocusPlan(raw: string | null | undefined): FocusPlan | null {
+  if (!raw) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object" || value === null) return null;
+  const r = value as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === "string" ? v : "");
+  const dropped = Array.isArray(r.dropped)
+    ? r.dropped
+        .map((d) => {
+          const item = (typeof d === "object" && d !== null ? d : {}) as Record<
+            string,
+            unknown
+          >;
+          return { point: str(item.point), detail: str(item.detail) };
+        })
+        .filter((d) => d.point.trim() !== "")
+    : [];
+  return {
+    focus: str(r.focus),
+    focusKind: r.focusKind === "concern" ? "concern" : "ingredient",
+    focusSource: r.focusSource === "inferred" ? "inferred" : "typed",
+    newTitle: str(r.newTitle),
+    originalTitle: str(r.originalTitle),
+    rationale: str(r.rationale),
+    dropped,
+  };
 }
 
 /**
@@ -251,6 +318,12 @@ export interface ShopSettingsData {
   /** Illustration settings: drawing quality, monthly cap, house style,
    *  remembered creation-form choices. */
   illustrations: IllustrationSettings;
+  /** Basket rename (Ingredient focus pages, Shopify Plus): activated by the
+   *  merchant in Settings; the Cart Transform id Shopify returned; the last
+   *  activation or sync error to show. */
+  basketRenameEnabled: boolean;
+  cartTransformId: string | null;
+  basketRenameError: string | null;
 }
 
 /** Base copy for one surface, already localized for the target locale. */
@@ -285,6 +358,9 @@ export interface ArticleAnalysis {
   v2Plan: V2Plan | null;
   /** Subtle-intent mode: concern, term decision, insertions. Null otherwise. */
   subtlePlan: SubtlePlan | null;
+  /** Ingredient focus mode: focus, new product name, rationale, removals.
+   *  Null otherwise. */
+  focusPlan: FocusPlan | null;
   adapted: Array<{
     key: string;
     adapted: string;
@@ -414,6 +490,11 @@ export interface VariantPayload {
     mode: "text" | "html";
     content: string;
   }>;
+  /** Ingredient focus pages with the basket rename active: the embed tags
+   *  this product's add-to-cart forms with the variant code (the Cart
+   *  Transform function renames the line) and the original product name
+   *  (the hidden staff note on the order). Absent otherwise. */
+  cart?: { code: string; original_title: string };
 }
 
 // ---------------------------------------------------------------------------

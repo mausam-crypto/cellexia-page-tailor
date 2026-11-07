@@ -285,6 +285,55 @@ with the **currently enabled** surfaces in Settings, so disabling a surface
 stops it on every live variant immediately, and empty content is never served
 (a blank swap could visibly damage the page).
 
+### Ingredient focus pages (added 2026-11-07)
+
+**At the merchant's explicit direction (2026-11-07), Ingredient focus pages
+reposition the product around one ingredient or concern, product name
+included, and are free-written.** They exist for shoppers searching for a
+single-ingredient product (a vitamin C serum) and can be made from an
+article or a brief. What this changes, and what it does not:
+
+- **The product name is a copy surface.** The page heading (and the sticky
+  bar, if its selector is listed) shows a new name built around the focus;
+  the brand and the product type are kept. The `<title>` tag, `og:title`,
+  JSON-LD, the canonical link, collection and search listings, breadcrumbs
+  and recommendation cards are never touched: the selector rules and the
+  serve-time filter apply to this surface exactly as to every other.
+- **Facts are not grounded.** The model may draw on the page, the article
+  or brief, references, facts the merchant pasted, and general cosmetic
+  knowledge, and may add claims, figures and percentages beyond them,
+  including product-specific facts (a concentration, a texture, a pH).
+  Every claim the guard finds in none of the sources is stored per section
+  as an unverified claim and shown under **Added facts to verify**, with
+  product-specific ones marked "Product fact" and listed first. The
+  deterministic pattern checks (percentages, clinical language, drug-like
+  words, guarantees, rankings, urgency) run unchanged. Nothing blocks: the
+  post-publication review model applies, so an invented product fact can
+  serve to visitors before anyone reads it. Keeping the page defensible,
+  and removing a wrong fact promptly, is the team's operational
+  responsibility.
+- **No ingredient-presence check.** The app does not verify that the
+  product contains the focus ingredient. A page positioning a product for an
+  ingredient it does not contain would be false advertising; whoever types
+  the focus is trusted.
+- **Other ingredients may be dropped** from the copy; a complete
+  ingredients list (INCI) is reproduced verbatim, and the facts of usage,
+  safety, shipping and policy answers are never altered.
+- **The basket rename (Shopify Plus) follows the page rename.** A Cart
+  Transform function renames a basket line only when the line carries the
+  hidden `_cx` property the embed sets on a focus page AND the product's
+  app-owned metafield maps that code to a live focus page's name. The map is
+  written only while serving is on, the rename is activated, the Product
+  name surface is enabled with a selector and the page is live; taking the
+  page offline, or switching serving off, removes the entry, and lines
+  already in a basket revert on their next change. The order keeps the title
+  at order time, plus a hidden `_Original product` note for staff. The
+  rename is deterministic per line (same code, same name for every shopper)
+  and involves no user-agent, referrer or bot logic.
+- **Serving is unchanged** for everything else: same URL, same content for
+  every visitor; the payload only gains the variant code and the original
+  name for the embed to tag this product's add-to-cart forms.
+
 ## Post-publication review (notification model)
 
 **This replaced the original pre-publication approval gate at the merchant's

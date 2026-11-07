@@ -28,7 +28,13 @@ import {
   removeMarker,
 } from "./figure-markup";
 import { figureJobAfterGeneration, runFigureJob } from "./illustrations.server";
-import { getSettings, unsafeSelectorReason } from "./settings.server";
+import { TITLE_SURFACE, getSettings, unsafeSelectorReason } from "./settings.server";
+import { basketRenameGate, syncCartTitlesForProduct } from "./cart-titles.server";
+import {
+  brandWordMissing,
+  cleanProductName,
+  productNameProblem,
+} from "./product-name";
 import {
   getLocalizedSurfaceContent,
   getPrimaryDomainUrl,
@@ -39,14 +45,17 @@ import {
 } from "./shopify-data.server";
 import {
   BRIEF_ADVANCED_FIELDS,
+  TITLE_SURFACE_KEY,
   illustrationsAllowed,
   normalizeAdaptationMode,
   normalizeBriefAdvanced,
   parseFigureJob,
   parseIllustrationPlan,
+  type AdaptationMode,
   type BriefAdvanced,
   type ClaimFindings,
   type CopySurface,
+  type FocusPlan,
   type IllustrationPlan,
   type ShopSettingsData,
   type SurfaceContent,
@@ -238,6 +247,10 @@ export async function createArticlesForProduct(
     /** Illustration choices for every article in this batch (JSON
      *  IllustrationPlan), applied by the figure phase after generation. */
     illustrationPlan?: string | null;
+    /** Ingredient focus mode: the focus for every article in the batch
+     *  (null = inferred per article) and optional pasted facts. */
+    focusTerm?: string | null;
+    focusFacts?: string | null;
   },
 ): Promise<string[]> {
   const product = await getProduct(admin, input.productId);
@@ -275,6 +288,14 @@ export async function createArticlesForProduct(
           sourceText: row.sourceText ?? null,
           mode: normalizeAdaptationMode(input.mode ?? "standard"),
           illustrationPlan: input.illustrationPlan ?? null,
+          focusTerm:
+            normalizeAdaptationMode(input.mode ?? "standard") === "focus"
+              ? input.focusTerm?.trim() || null
+              : null,
+          focusFacts:
+            normalizeAdaptationMode(input.mode ?? "standard") === "focus"
+              ? input.focusFacts?.trim() || null
+              : null,
           status: "pending",
           variantHandle: generateVariantHandle(),
         },
@@ -318,6 +339,9 @@ export async function createBriefsForProduct(
       advanced?: BriefAdvanced;
       /** JSON IllustrationPlan for this brief (every language of it). */
       illustrationPlan?: string | null;
+      /** Ingredient focus: the focus (required for the mode) and optional
+       *  pasted facts. Absent = a standard brief. */
+      focus?: { term: string; facts?: string | null } | null;
     }>;
   },
 ): Promise<string[]> {
@@ -338,6 +362,7 @@ export async function createBriefsForProduct(
   const created = await prisma.$transaction(
     rows.map(({ locale, brief }) => {
       const advanced = normalizeBriefAdvanced(brief.advanced ?? {});
+      const focusTerm = brief.focus?.term?.trim() || null;
       return prisma.article.create({
         data: {
           shop,
@@ -352,7 +377,11 @@ export async function createBriefsForProduct(
           briefAdvanced:
             Object.keys(advanced).length > 0 ? JSON.stringify(advanced) : null,
           illustrationPlan: brief.illustrationPlan ?? null,
-          mode: "standard",
+          // Briefs know two modes: standard, or Ingredient focus when the
+          // brief names a focus.
+          mode: focusTerm ? "focus" : "standard",
+          focusTerm,
+          focusFacts: focusTerm ? brief.focus?.facts?.trim() || null : null,
           status: "pending",
           variantHandle: generateVariantHandle(),
         },
@@ -431,6 +460,7 @@ export async function generateForArticle(
       }
       if (runKind === "refine") {
         await runBriefRefinement(
+          admin,
           article,
           existing,
           (article.pendingRefinement ?? "").trim(),
@@ -457,12 +487,15 @@ export async function generateForArticle(
     }
     if (!text) throw new Error("Article has no content to analyze.");
 
+    const mode = normalizeAdaptationMode(article.mode);
+    const isFocus = mode === "focus";
     const surfaces = await collectBaseSurfaces(
       admin,
       article,
       settings,
       primary,
       isPrimaryLocale,
+      { mode },
     );
 
     const analysis = await analyzeAndAdapt({
@@ -471,8 +504,11 @@ export async function generateForArticle(
       productTitle: article.productTitle,
       locale: article.locale,
       intensity: settings.intensity,
-      mode: normalizeAdaptationMode(article.mode),
+      mode,
       subtle: settings.subtle,
+      focus: isFocus
+        ? { term: article.focusTerm, facts: article.focusFacts }
+        : undefined,
       surfaces,
     });
 
@@ -501,11 +537,17 @@ export async function generateForArticle(
       throw new Error("Generation produced no usable surfaces. Retry.");
     }
 
+    // Ingredient focus: the product name is one usable line of text, or
+    // the generation fails (retryable) rather than renaming the product to
+    // nothing. A name that drops the brand word is allowed but reported.
+    const focusWarnings: string[] = [];
+    const titlePair = isFocus ? finalizeProductName(pairs, focusWarnings) : null;
+
     // Ultra mode's removal permission must never leave a heading with no
     // body or an empty list on the live page: deterministic backstop on top
     // of the prompt rule. Fails the generation loudly (retryable) instead
     // of serving a visibly broken section.
-    if (["ultra", "persona", "max", "v2"].includes(normalizeAdaptationMode(article.mode))) {
+    if (["ultra", "persona", "max", "v2", "focus"].includes(mode)) {
       for (const pair of pairs) {
         const surface = surfaces.find((s) => s.surface.key === pair.key);
         if (surface?.surface.mode !== "html") continue;
@@ -534,10 +576,17 @@ export async function generateForArticle(
       }
     }
 
+    // Ingredient focus: the guard lists every added fact (nothing blocks);
+    // its findings go to unverifiedClaims below, not to warnings.
     const guard = await claimGuard(
       pairs,
-      text,
-      normalizeAdaptationMode(article.mode),
+      isFocus
+        ? [text, article.focusFacts?.trim() ? `<focus_facts>\n${article.focusFacts.trim()}\n</focus_facts>` : ""]
+            .filter(Boolean)
+            .join("\n\n")
+        : text,
+      mode,
+      { source: isFocus ? "focus" : "article" },
     );
 
     // Same completeness rule as the adaptation pass: a surface the guard
@@ -611,8 +660,10 @@ export async function generateForArticle(
         // Proof-token downgrades are a Meta-mode-only affordance.
         metaMode: article.mode === "meta",
       });
+      // Ingredient focus: the model guard's list is review information
+      // ("Added facts to verify"), kept apart from the pattern warnings.
       const warnings = [
-        ...(guardFindings?.warnings ?? []),
+        ...(isFocus ? [] : (guardFindings?.warnings ?? [])),
         ...heuristics.warnings,
       ];
       const articleClaims = [
@@ -632,11 +683,22 @@ export async function generateForArticle(
         articleClaims: articleClaims.length
           ? JSON.stringify(articleClaims)
           : null,
-        unverifiedClaims: null,
+        unverifiedClaims: isFocus ? findingsJson(guardFindings?.warnings) : null,
         enabled: true,
         ...carriedFigureFields(previousRows, pair.key),
       };
     });
+
+    const focusPlanJson =
+      isFocus && analysis.focusPlan
+        ? JSON.stringify(
+            finalizeFocusPlan(
+              analysis.focusPlan,
+              storedAdapted.get(TITLE_SURFACE_KEY) ?? "",
+              titlePair?.original ?? "",
+            ),
+          )
+        : null;
 
     // Version history: the copy this generation replaces becomes the
     // "before" (a baseline is created lazily for pre-history articles) and
@@ -657,12 +719,14 @@ export async function generateForArticle(
         kind: "generate",
         snapshot: overrideRows,
         previousSnapshot,
+        runWarnings: focusWarnings,
       }),
       prisma.article.update({
         where: { id: article.id },
         data: {
           sourceTitle: title || null,
           sourceText: text,
+          focusPlan: focusPlanJson,
           detectedQuery: analysis.detectedQuery,
           queryVariants: JSON.stringify(analysis.queryVariants),
           evidence: JSON.stringify(analysis.evidence),
@@ -726,7 +790,7 @@ export async function generateForArticle(
                 })),
               })
             : null,
-          generatedMode: normalizeAdaptationMode(article.mode),
+          generatedMode: mode,
           // Post-publication review model: a successful generation goes live
           // immediately (served only while the master serving switch is on)
           // and resets reviewedAt so the merchant is notified to review the
@@ -742,6 +806,11 @@ export async function generateForArticle(
       }),
     ]);
     await pruneVersions(article.id);
+    // Basket rename: the product's name map follows the live copy. Also
+    // when a former focus page regenerates in another mode (its entry goes).
+    if (isFocus || article.generatedMode === "focus") {
+      await syncCartTitlesForProduct(shop, article.productId, admin);
+    }
     await runFigurePhase(
       admin,
       shop,
@@ -756,6 +825,52 @@ export async function generateForArticle(
     await recordGenerationFailure(article.id, error, runKind);
     throw error;
   }
+}
+
+/**
+ * Ingredient focus: the "title" pair's adapted text becomes one clean line
+ * (markup stripped, quotes removed) or the generation fails; mutates the
+ * pair in place and returns it. A new name without the original's first
+ * word (normally the brand) is allowed but recorded as a run warning.
+ */
+function finalizeProductName(
+  pairs: Array<{ key: string; original: string; adapted: string }>,
+  warnings: string[],
+): { key: string; original: string; adapted: string } {
+  const titlePair = pairs.find((p) => p.key === TITLE_SURFACE_KEY);
+  if (!titlePair) {
+    throw new Error(
+      "Generation did not return the product name. Retry the generation.",
+    );
+  }
+  const name = cleanProductName(normalizeGeneratedPunctuation(titlePair.adapted));
+  const problem = productNameProblem(name);
+  if (problem) {
+    throw new Error(
+      `The generated product name ${problem} ("${name.slice(0, 80)}"). Retry the generation.`,
+    );
+  }
+  titlePair.adapted = name;
+  if (brandWordMissing(titlePair.original, name)) {
+    warnings.push(
+      `The new product name "${name}" does not contain the first word of the original name ("${cleanProductName(titlePair.original)}"). Edit it on this page if the brand should stay in the name.`,
+    );
+  }
+  return titlePair;
+}
+
+/** The stored focus plan: the title fields come from what was actually
+ *  stored, never from the model's self-report. */
+function finalizeFocusPlan(
+  plan: FocusPlan,
+  storedTitle: string,
+  originalTitle: string,
+): FocusPlan {
+  return {
+    ...plan,
+    newTitle: storedTitle || plan.newTitle,
+    originalTitle: cleanProductName(originalTitle),
+  };
 }
 
 /**
@@ -1090,6 +1205,34 @@ export async function getVariantPayload(
     );
   if (ops.length === 0) return null;
 
+  // Basket rename (Ingredient focus pages): tell the embed to tag this
+  // product's add-to-cart forms, but only while the heading itself is
+  // being renamed - the same gate the metafield map uses - so the basket
+  // never shows a name the page does not.
+  const titleSurface = currentSurfaces.get(TITLE_SURFACE_KEY);
+  const titleOverride = article.overrides.find(
+    (o) => o.surfaceKey === TITLE_SURFACE_KEY && o.enabled && o.mode === "text",
+  );
+  const titleServed =
+    article.generatedMode === "focus" &&
+    basketRenameGate(settings).active &&
+    titleSurface !== undefined &&
+    titleOverride !== undefined &&
+    ops.some(
+      (op) => op.selector === titleSurface.selector && op.mode === "text",
+    );
+  if (titleServed && titleOverride) {
+    return {
+      v: variantHandle,
+      locale: article.locale,
+      ops,
+      cart: {
+        code: variantHandle,
+        original_title: cleanProductName(titleOverride.original).slice(0, 255),
+      },
+    };
+  }
+
   return { v: variantHandle, locale: article.locale, ops };
 }
 
@@ -1194,18 +1337,48 @@ async function collectBaseSurfaces(
   settings: ShopSettingsData,
   primary: string,
   isPrimaryLocale: boolean,
+  options: { mode: AdaptationMode } = { mode: "standard" },
 ): Promise<SurfaceContent[]> {
-  const adminSurfaces = settings.surfaces.filter((s) => s.source !== "page");
+  // The product name is generated ONLY in Ingredient focus mode - always
+  // there (the basket rename needs it even before the merchant sets its
+  // selector), never elsewhere (enabling the surface in Settings must not
+  // let another mode rename the product).
+  const configuredTitle =
+    settings.surfaces.find((s) => s.key === TITLE_SURFACE_KEY) ?? TITLE_SURFACE;
+  const adminSurfaces = settings.surfaces.filter(
+    (s) => s.source !== "page" && s.key !== TITLE_SURFACE_KEY,
+  );
+  if (options.mode === "focus") {
+    adminSurfaces.push({
+      ...configuredTitle,
+      source: "title",
+      mode: "text",
+      enabled: true,
+      // getLocalizedSurfaceContent skips selector-less surfaces; the real
+      // selector (possibly empty) is restored on the result below, and
+      // serving reads Settings, never this value.
+      selector: configuredTitle.selector.trim() || "-",
+    });
+  }
   const pageSurfaces = settings.surfaces.filter(
     (s) => s.source === "page" && s.enabled && s.selector.trim() !== "",
   );
 
-  const surfaces = await getLocalizedSurfaceContent(
-    admin,
-    article.productId,
-    article.locale,
-    adminSurfaces,
-    isPrimaryLocale,
+  const surfaces = (
+    await getLocalizedSurfaceContent(
+      admin,
+      article.productId,
+      article.locale,
+      adminSurfaces,
+      isPrimaryLocale,
+    )
+  ).map((s) =>
+    s.surface.key === TITLE_SURFACE_KEY
+      ? {
+          surface: { ...configuredTitle, source: "title" as const, mode: "text" as const },
+          content: cleanProductName(s.content),
+        }
+      : s,
   );
   if (pageSurfaces.length > 0) {
     surfaces.push(
@@ -1322,12 +1495,20 @@ async function runBriefPipeline(
   if (!brief) {
     throw new Error("This brief is empty. Edit the brief, then start over.");
   }
+  const isFocus = article.mode === "focus";
+  const focusTerm = (article.focusTerm ?? "").trim();
+  if (isFocus && !focusTerm) {
+    throw new Error(
+      "This page is in Ingredient focus mode but has no focus. Edit the brief, add the focus, then start over.",
+    );
+  }
   const surfaces = await collectBaseSurfaces(
     admin,
     article,
     settings,
     primary,
     isPrimaryLocale,
+    { mode: isFocus ? "focus" : "standard" },
   );
   const { referencesText, runWarnings } = await resolveBriefReferences(
     article.briefReferences,
@@ -1340,6 +1521,7 @@ async function runBriefPipeline(
     brief,
     referencesText,
     surfaces,
+    focus: isFocus ? { term: focusTerm, facts: article.focusFacts } : undefined,
   });
 
   const missing = surfaces.filter(
@@ -1364,6 +1546,9 @@ async function runBriefPipeline(
     throw new Error("Generation produced no usable surfaces. Retry.");
   }
 
+  const focusWarnings: string[] = [];
+  const titlePair = isFocus ? finalizeProductName(pairs, focusWarnings) : null;
+
   for (const pair of pairs) {
     const surface = surfaces.find((s) => s.surface.key === pair.key);
     if (surface?.surface.mode !== "html") continue;
@@ -1381,9 +1566,17 @@ async function runBriefPipeline(
     }
   }
 
-  const sourceText = [brief, referencesText].filter(Boolean).join("\n\n");
-  const guard = await claimGuard(pairs, sourceText, "standard", {
-    source: "brief",
+  const sourceText = [
+    brief,
+    referencesText,
+    isFocus && article.focusFacts?.trim()
+      ? `<focus_facts>\n${article.focusFacts.trim()}\n</focus_facts>`
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  const guard = await claimGuard(pairs, sourceText, isFocus ? "focus" : "standard", {
+    source: isFocus ? "focus" : "brief",
   });
   const guardMissing = pairs.filter((p) => !guard.has(p.key));
   if (guardMissing.length > 0) {
@@ -1436,6 +1629,17 @@ async function runBriefPipeline(
     };
   });
 
+  const focusPlanJson =
+    isFocus && result.focusPlan
+      ? JSON.stringify(
+          finalizeFocusPlan(
+            result.focusPlan,
+            overrideRows.find((r) => r.surfaceKey === TITLE_SURFACE_KEY)?.adapted ?? "",
+            titlePair?.original ?? "",
+          ),
+        )
+      : null;
+
   const { number, previousSnapshot } = await prepareVersion(article.id, existing);
   await prisma.$transaction([
     prisma.override.deleteMany({ where: { articleId: article.id } }),
@@ -1449,12 +1653,13 @@ async function runBriefPipeline(
       snapshot: overrideRows,
       previousSnapshot,
       modelNotes: result.summary || null,
-      runWarnings,
+      runWarnings: [...runWarnings, ...focusWarnings],
     }),
     prisma.article.update({
       where: { id: article.id },
       data: {
-        generatedMode: "standard",
+        generatedMode: isFocus ? "focus" : "standard",
+        focusPlan: focusPlanJson,
         // Post-publication review model, same as articles: live at once,
         // reviewedAt reset so the merchant is notified to read the copy.
         status: "approved",
@@ -1468,6 +1673,9 @@ async function runBriefPipeline(
     }),
   ]);
   await pruneVersions(article.id);
+  if (isFocus || article.generatedMode === "focus") {
+    await syncCartTitlesForProduct(article.shop, article.productId, admin);
+  }
   await runFigurePhase(
     admin,
     article.shop,
@@ -1488,6 +1696,7 @@ async function runBriefPipeline(
  * leaves the live copy exactly as it was.
  */
 async function runBriefRefinement(
+  admin: AdminClient,
   article: ArticleRow,
   existing: OverrideRow[],
   instruction: string,
@@ -1496,6 +1705,11 @@ async function runBriefRefinement(
   const { referencesText, runWarnings } = await resolveBriefReferences(
     article.briefReferences,
   );
+  // The stored copy decides: a page generated in Ingredient focus mode is
+  // refined with the focus rules (free facts, product name surface), even
+  // if the brief's mode was switched since (Start over applies that).
+  const isFocus = article.generatedMode === "focus";
+  const focusTerm = (article.focusTerm ?? "").trim();
 
   // Earlier instructions still in force: every refinement since the last
   // full generation or restore (either of those starts a fresh chain).
@@ -1527,6 +1741,7 @@ async function runBriefRefinement(
     })),
     previousInstructions,
     instruction,
+    focus: isFocus ? { term: focusTerm } : null,
   });
 
   const byKey = new Map(result.surfaces.map((r) => [r.key, r]));
@@ -1553,7 +1768,17 @@ async function runBriefRefinement(
     let adaptedContent =
       o.mode === "html"
         ? sanitizeAdaptedHtml(dashFree, { allowedImageSrcs: imageSrcsOf(o.original) })
-        : dashFree;
+        : o.surfaceKey === TITLE_SURFACE_KEY
+          ? cleanProductName(dashFree)
+          : dashFree;
+    if (o.surfaceKey === TITLE_SURFACE_KEY) {
+      const problem = productNameProblem(adaptedContent);
+      if (problem) {
+        throw new Error(
+          `The refinement produced a product name that ${problem}. Rephrase the instruction and retry.`,
+        );
+      }
+    }
     // Deterministic backstop for the prompt's marker rule: the illustration
     // marker survives every refinement, at its previous spot when the model
     // dropped it.
@@ -1606,9 +1831,17 @@ async function runBriefRefinement(
         original: o.original,
         adapted: changes.get(o.surfaceKey)!.rawAdapted,
       }));
-    const sourceText = [brief, referencesText].filter(Boolean).join("\n\n");
-    guard = await claimGuard(changedPairs, sourceText, "standard", {
-      source: "brief",
+    const sourceText = [
+      brief,
+      referencesText,
+      isFocus && article.focusFacts?.trim()
+        ? `<focus_facts>\n${article.focusFacts.trim()}\n</focus_facts>`
+        : "",
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+    guard = await claimGuard(changedPairs, sourceText, isFocus ? "focus" : "standard", {
+      source: isFocus ? "focus" : "brief",
     });
     const guardMissing = changedPairs.filter((p) => !guard.has(p.key));
     if (guardMissing.length > 0) {
@@ -1681,6 +1914,15 @@ async function runBriefRefinement(
         // New model-written copy is live and unread: notify for review.
         // A refinement that changed nothing leaves the review stamp alone.
         ...(changes.size > 0 ? { reviewedAt: null } : {}),
+        // The focus plan's title follows a renamed product.
+        ...(isFocus && changes.has(TITLE_SURFACE_KEY)
+          ? {
+              focusPlan: JSON.stringify({
+                ...(parseStoredFocusPlan(article.focusPlan) ?? {}),
+                newTitle: changes.get(TITLE_SURFACE_KEY)!.adaptedContent,
+              }),
+            }
+          : {}),
         errorMessage: null,
         generatingAt: null,
         pendingRefinement: null,
@@ -1689,6 +1931,19 @@ async function runBriefRefinement(
     }),
   ]);
   await pruneVersions(article.id);
+  if (isFocus && changes.has(TITLE_SURFACE_KEY)) {
+    await syncCartTitlesForProduct(article.shop, article.productId, admin);
+  }
+}
+
+function parseStoredFocusPlan(raw: string | null): Record<string, unknown> | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1746,6 +2001,9 @@ export async function duplicateArticle(
         conversionPlan: source.conversionPlan,
         v2Plan: source.v2Plan,
         subtlePlan: source.subtlePlan,
+        focusTerm: source.focusTerm,
+        focusFacts: source.focusFacts,
+        focusPlan: source.focusPlan,
         illustrationPlan: source.illustrationPlan,
         mode: source.mode,
         generatedMode: source.generatedMode,
@@ -1788,5 +2046,9 @@ export async function duplicateArticle(
     });
     return copy;
   });
+  // A live copy of an Ingredient focus page gets its own basket name entry.
+  if (created.status === "approved" && created.generatedMode === "focus") {
+    await syncCartTitlesForProduct(shop, created.productId);
+  }
   return created.id;
 }

@@ -47,6 +47,8 @@ import {
   computeExperimentReport,
   refreshExperimentStatus,
 } from "../services/experiment.server";
+import { parseFocusPlan } from "../services/types";
+import { syncCartTitlesForProduct } from "../services/cart-titles.server";
 
 export const loader = async ({ request }: LoaderFunctionArgs) => {
   const { admin, session } = await authenticate.admin(request);
@@ -159,6 +161,11 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
       sourceTitle: article.sourceTitle,
       sourceUrl: article.sourceUrl,
       detectedQuery: article.detectedQuery,
+      // Ingredient focus: the typed focus, else the one the AI inferred.
+      focusTerm:
+        article.mode === "focus" || article.generatedMode === "focus"
+          ? (article.focusTerm ?? parseFocusPlan(article.focusPlan)?.focus ?? null)
+          : null,
       status: article.status,
       mode: article.mode,
       reviewedAt: article.reviewedAt ? article.reviewedAt.toISOString() : null,
@@ -227,9 +234,17 @@ export const action = async ({ request }: ActionFunctionArgs) => {
   }
 
   if (intent === "delete" && articleId) {
+    // A deleted Ingredient focus page must leave the basket name map too.
+    const target = await prisma.article.findFirst({
+      where: { id: articleId, shop: session.shop },
+      select: { productId: true, generatedMode: true },
+    });
     await prisma.article.deleteMany({
       where: { id: articleId, shop: session.shop },
     });
+    if (target?.generatedMode === "focus") {
+      await syncCartTitlesForProduct(session.shop, target.productId);
+    }
     return { ok: true, articleId };
   }
 
@@ -310,6 +325,7 @@ type ArticleRow = {
   sourceTitle: string | null;
   sourceUrl: string | null;
   detectedQuery: string | null;
+  focusTerm: string | null;
   status: string;
   mode: string;
   reviewedAt: string | null;
@@ -403,7 +419,9 @@ function buildLinksCsv(rows: ArticleRow[], servingEnabled: boolean): string {
                 ? "Ultra Custom V2"
                 : a.mode === "subtle"
                   ? "Subtle intent"
-                  : "Standard",
+                  : a.mode === "focus"
+                    ? `Ingredient focus${a.focusTerm ? ` (${a.focusTerm})` : ""}`
+                    : "Standard",
       statusTextFor(a),
       a.detectedQuery ?? "",
       a.createdAt.slice(0, 10),
@@ -567,6 +585,7 @@ export default function Index() {
     { label: "Ultra deep persona only", value: "persona" },
     { label: "Conversion Max only", value: "max" },
     { label: "Ultra Custom V2 only", value: "v2" },
+    { label: "Ingredient focus only", value: "focus" },
   ];
 
   // All filters stack: status tab, product, language, source, mode, and
@@ -586,6 +605,7 @@ export default function Index() {
       article.sourceTitle ?? "",
       article.sourceUrl ?? "",
       article.detectedQuery ?? "",
+      article.focusTerm ?? "",
       article.localeName,
     ]
       .join(" ")
@@ -674,7 +694,9 @@ export default function Index() {
       </IndexTable.Cell>
       <IndexTable.Cell>
         <Text as="span" variant="bodyMd" truncate>
-          {article.detectedQuery ?? "—"}
+          {article.focusTerm
+            ? `Focus: ${article.focusTerm}`
+            : (article.detectedQuery ?? "—")}
         </Text>
       </IndexTable.Cell>
       <IndexTable.Cell>
@@ -696,6 +718,7 @@ export default function Index() {
           ) : null}
           {article.mode === "max" ? <Badge tone="magic">Max</Badge> : null}
           {article.mode === "v2" ? <Badge tone="magic">V2</Badge> : null}
+          {article.mode === "focus" ? <Badge tone="magic">Focus</Badge> : null}
           {article.hasWarnings &&
           article.status === "approved" &&
           !article.reviewedAt &&

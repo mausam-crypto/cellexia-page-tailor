@@ -527,6 +527,10 @@ export async function getLocalizedSurfaceContent(
     if (surface.source === "description") {
       content =
         productTranslations.get("body_html") ?? product.descriptionHtml ?? "";
+    } else if (surface.source === "title") {
+      // The product name, in the page's language (Translate & Adapt stores
+      // the translated title under the "title" key).
+      content = productTranslations.get("title") ?? product.title ?? "";
     } else {
       const mf = metafields.find(
         (m) =>
