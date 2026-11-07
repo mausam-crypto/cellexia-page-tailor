@@ -290,56 +290,6 @@ const ANALYSIS_SCHEMA = {
       description:
         "Subtle intent mode only: the concern, the term decision, and every planted sentence. Empty strings and empty array otherwise.",
     },
-    focus_plan: {
-      type: "object",
-      properties: {
-        focus: {
-          type: "string",
-          description:
-            "Ingredient focus mode only: the single ingredient or concern the page is built around, as given or as inferred. Empty string otherwise.",
-        },
-        focus_kind: {
-          type: "string",
-          enum: ["ingredient", "concern", ""],
-          description:
-            "Ingredient focus mode only: whether the focus is an ingredient or a concern. Empty string otherwise.",
-        },
-        new_title: {
-          type: "string",
-          description:
-            "Ingredient focus mode only: the new product name, identical to the adapted text of the title surface. Empty string otherwise.",
-        },
-        rationale: {
-          type: "string",
-          description:
-            "Ingredient focus mode only: 2-3 sentences on how the page was repositioned and which facts were added beyond the sources. Empty string otherwise.",
-        },
-        dropped: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              point: {
-                type: "string",
-                description: "One ingredient, benefit, sentence or list item removed from the page",
-              },
-              detail: {
-                type: "string",
-                description: "The surface it was removed from and why",
-              },
-            },
-            required: ["point", "detail"],
-            additionalProperties: false,
-          },
-          description:
-            "Ingredient focus mode only: every removal. Empty array otherwise.",
-        },
-      },
-      required: ["focus", "focus_kind", "new_title", "rationale", "dropped"],
-      additionalProperties: false,
-      description:
-        "Ingredient focus mode only: the focus, the new product name, the rationale and every removal. Empty strings and empty array otherwise.",
-    },
     surfaces: {
       type: "array",
       items: {
@@ -371,15 +321,70 @@ const ANALYSIS_SCHEMA = {
     "conversion_plan",
     "v2_plan",
     "subtle_plan",
-    "focus_plan",
     "surfaces",
   ],
   additionalProperties: false,
 } as const;
 
-// Ingredient focus mode (brief-sourced): the brief schema plus the focus
-// plan. Kept separate so the standard brief schema stays untouched.
-const FOCUS_PLAN_SCHEMA = ANALYSIS_SCHEMA.properties.focus_plan;
+// Ingredient focus mode has its OWN output schemas. The provider compiles
+// the structured-output schema into a grammar with a size limit, and the
+// shared ANALYSIS_SCHEMA (every mode's plan object) is already close to
+// it: adding the focus plan there tipped every article generation into
+// "The compiled grammar is too large". So: the other modes keep the exact
+// schema they always had, and focus mode sends a small one with only the
+// query analysis, the focus plan and the surfaces.
+const FOCUS_PLAN_SCHEMA = {
+  type: "object",
+  properties: {
+    focus: {
+      type: "string",
+      description:
+        "The single ingredient or concern the page is built around, as given or as inferred",
+    },
+    focus_kind: {
+      type: "string",
+      description: '"ingredient" or "concern"',
+    },
+    new_title: {
+      type: "string",
+      description:
+        "The new product name, identical to the adapted text of the title surface",
+    },
+    rationale: {
+      type: "string",
+      description:
+        "2-3 sentences: how the page was repositioned and which facts were added beyond the sources",
+    },
+    dropped: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          point: { type: "string", description: "What was removed" },
+          detail: { type: "string", description: "From which surface and why" },
+        },
+        required: ["point", "detail"],
+        additionalProperties: false,
+      },
+      description: "Every ingredient, benefit, sentence or list item removed from the page",
+    },
+  },
+  required: ["focus", "focus_kind", "new_title", "rationale", "dropped"],
+  additionalProperties: false,
+} as const;
+
+const FOCUS_ANALYSIS_SCHEMA = {
+  type: "object",
+  properties: {
+    detected_query: ANALYSIS_SCHEMA.properties.detected_query,
+    query_variants: ANALYSIS_SCHEMA.properties.query_variants,
+    evidence: ANALYSIS_SCHEMA.properties.evidence,
+    focus_plan: FOCUS_PLAN_SCHEMA,
+    surfaces: ANALYSIS_SCHEMA.properties.surfaces,
+  },
+  required: ["detected_query", "query_variants", "evidence", "focus_plan", "surfaces"],
+  additionalProperties: false,
+} as const;
 
 const GUARD_SCHEMA = {
   type: "object",
@@ -575,7 +580,7 @@ function focusDepth(options: { typed: boolean; hasFacts: boolean }): string {
 
 ${step1}
 
-${focusRepositioningSteps({ sources: "the article", hasFacts: options.hasFacts, firstStep: 2 })} Return empty proof_points and persona_priorities arrays, an empty conversion_plan, an empty v2_plan and an empty subtle_plan: none are used in this mode.`;
+${focusRepositioningSteps({ sources: "the article", hasFacts: options.hasFacts, firstStep: 2 })}`;
 }
 
 function adaptationSystemPrompt(
@@ -875,7 +880,11 @@ ${
       output_config: {
         format: {
           type: "json_schema",
-          schema: ANALYSIS_SCHEMA as unknown as Record<string, unknown>,
+          // Focus mode: its own small schema (see FOCUS_ANALYSIS_SCHEMA).
+          schema: (isFocus ? FOCUS_ANALYSIS_SCHEMA : ANALYSIS_SCHEMA) as unknown as Record<
+            string,
+            unknown
+          >,
         },
       },
       messages: [{ role: "user", content: userContent }],
@@ -911,7 +920,9 @@ ${
       term_decision: string;
       insertions: Array<{ point: string; detail: string }>;
     };
-    focus_plan: {
+    // Focus mode only (its schema has no other plan objects; the gates
+    // below never read those in focus mode, and never read this elsewhere).
+    focus_plan?: {
       focus: string;
       focus_kind: string;
       new_title: string;
@@ -959,9 +970,10 @@ ${
             insertions: parsed.subtle_plan.insertions,
           }
         : null,
-    focusPlan: isFocus
-      ? focusPlanFromModel(parsed.focus_plan, focusTerm)
-      : null,
+    focusPlan:
+      isFocus && parsed.focus_plan
+        ? focusPlanFromModel(parsed.focus_plan, focusTerm)
+        : null,
     adapted: parsed.surfaces,
   };
 }

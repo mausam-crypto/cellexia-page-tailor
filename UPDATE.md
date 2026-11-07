@@ -5,6 +5,14 @@ setup, use [INSTALL.md](INSTALL.md).
 
 ## What's new in this update (2026-11-07 — Ingredient focus pages and the basket rename)
 
+> **Same-day fix (2026-11-07, zip rebuilt):** the first build of this release
+> made EVERY article generation fail with "The compiled grammar is too large"
+> (the AI provider limits the size of the structured-output schema, and the
+> focus plan had been added to the schema shared by all article modes).
+> Ingredient focus now sends its own small schema; the other modes send the
+> exact schema they always had. If you deployed the first build, redeploy
+> this one: no migration, no `npm run deploy` needed for this fix alone.
+
 A new adaptation mode, **Ingredient focus**, repositions a page around ONE
 ingredient or concern, product name included (a four-active serum becomes
 "Cellexia Vitamin C Serum"), from an article or a brief. With the optional
