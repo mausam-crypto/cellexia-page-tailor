@@ -8,6 +8,7 @@ api_version = "2026-04"
 [[extensions]]
 name = "Page Tailor basket rename"
 handle = "cart-rename"
+uid = "24a219ab-a145-4c0c-d3a7-dab38039a19155da5733"
 type = "function"
 description = "Shows a Page Tailor Ingredient focus page's product name on basket lines added from that page (Shopify Plus)."
 
