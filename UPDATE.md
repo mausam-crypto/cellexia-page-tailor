@@ -12,6 +12,29 @@ setup, use [INSTALL.md](INSTALL.md).
 > Ingredient focus now sends its own small schema; the other modes send the
 > exact schema they always had. If you deployed the first build, redeploy
 > this one: no migration, no `npm run deploy` needed for this fix alone.
+>
+> **Second fix (2026-11-08, zip rebuilt):** Ingredient focus generations
+> could fail with "Generation output was cut off (claim guard pass)". The
+> fact-check pass had an 8,000-token budget, and the model's thinking counts
+> against it; a focus page rewrites every section and adds new facts, so the
+> check ran out. The check now has a 64,000-token budget, checks at most
+> three sections per call, splits a call in half and re-checks when one still
+> runs out, and re-checks once any section a response left out. On brief and
+> Ingredient focus pages, a section that still cannot be checked is listed
+> under "Added facts to verify" as "Product fact: The automatic fact check
+> could not finish for this section..." instead of failing the page; on
+> article pages it still fails (the check is their approval gate). The main
+> generation passes also moved from 32,000 to 64,000 tokens. No prompt text
+> changed. Redeploy the server; no migration, no `npm run deploy` needed for
+> this fix alone. Then press Retry on the failed page.
+>
+> **Same-day follow-up (zip rebuilt again):** the fact check also no longer
+> fails a page when one of its answers is declined or unreadable (that batch
+> is split and re-checked, like a cut-off one). On brief and Ingredient focus
+> pages, a fact-check request that still errors after the automatic retries
+> (rate limit, overload, network) is tried once more after 20 seconds, then
+> its sections are flagged for a manual check instead of failing the page.
+> Article pages keep failing in those cases, as before. No prompt text changed.
 
 A new adaptation mode, **Ingredient focus**, repositions a page around ONE
 ingredient or concern, product name included (a four-active serum becomes

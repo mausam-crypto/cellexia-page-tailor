@@ -11,6 +11,11 @@ import { DEFAULT_SUBTLE_SETTINGS, TITLE_SURFACE_KEY } from "./types";
 
 const MODEL = process.env.PAGE_TAILOR_MODEL || "claude-opus-4-8";
 
+// Output budget for the streamed generation passes (adaptation, brief,
+// refinement). Adaptive thinking counts against it; Opus 4.8 allows 128K
+// when streaming. Only a run that would otherwise be cut off uses more.
+const GENERATION_MAX_TOKENS = 64000;
+
 let _client: Anthropic | null = null;
 function client(): Anthropic {
   if (!process.env.ANTHROPIC_API_KEY) {
@@ -871,7 +876,7 @@ ${
   const response = await client()
     .messages.stream({
       model: MODEL,
-      max_tokens: 32000,
+      max_tokens: GENERATION_MAX_TOKENS,
       thinking: { type: "adaptive" },
       system: adaptationSystemPrompt(options.mode, options.subtle, {
         typed: focusTerm !== "",
@@ -1178,7 +1183,7 @@ ${
   const response = await client()
     .messages.stream({
       model: MODEL,
-      max_tokens: 32000,
+      max_tokens: GENERATION_MAX_TOKENS,
       thinking: { type: "adaptive" },
       system: isFocus ? briefFocusSystemPrompt(focusFacts !== "") : briefSystemPrompt(),
       output_config: {
@@ -1286,7 +1291,7 @@ Apply the instruction to the current copy. Return every surface: unchanged=true 
   const response = await client()
     .messages.stream({
       model: MODEL,
-      max_tokens: 32000,
+      max_tokens: GENERATION_MAX_TOKENS,
       thinking: { type: "adaptive" },
       system: refineSystemPrompt(options.focus?.term?.trim() || null),
       output_config: {
@@ -1315,18 +1320,147 @@ Apply the instruction to the current copy. Return every surface: unchanged=true 
   };
 }
 
+// Claim guard output budget. Adaptive thinking counts against max_tokens,
+// and an Ingredient focus page (every section rewritten, new facts allowed)
+// gives the guard far more to reason about and list than other modes: the
+// old 8,000-token cap was exhausted on a real focus page (2026-11-08). The
+// guard is streamed, so a large cap costs nothing unless it is used.
+const GUARD_MAX_TOKENS = 64000;
+
+// Surfaces per guard call, bounded by count and by copy size, so no single
+// call has to classify a whole rewritten page at once.
+const GUARD_BATCH_MAX_SURFACES = 3;
+const GUARD_BATCH_MAX_CHARS = 16000;
+
+// A guard response that cannot be used for its batch (cut off, declined,
+// unreadable): the batch is split and re-checked rather than failing the
+// whole page. The message is the one a merchant sees if it still fails.
+class GuardIncompleteError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GuardIncompleteError";
+  }
+}
+
+const GUARD_CUT_OFF_MESSAGE = `Generation output was cut off (claim guard pass): the combined copy surfaces are too long. Disable some surfaces in Settings or shorten the copy, then retry.`;
+
+// Review-only pages: a batch whose request still fails after the client's
+// own retries (rate limit, overload, network) is tried once more after
+// this pause before its sections are flagged for a manual check.
+const GUARD_RETRY_PAUSE_MS = 20_000;
+
+/** Finding stored when the guard cannot finish one section (review-only pages). */
+export const GUARD_INCOMPLETE_NOTE =
+  "The automatic fact check could not finish for this section. Read it in full and verify every fact it states.";
+
+function guardBatches<T extends { original: string; adapted: string }>(pairs: T[]): T[][] {
+  const batches: T[][] = [];
+  let current: T[] = [];
+  let size = 0;
+  for (const pair of pairs) {
+    const pairSize = pair.original.length + pair.adapted.length;
+    if (
+      current.length > 0 &&
+      (current.length >= GUARD_BATCH_MAX_SURFACES || size + pairSize > GUARD_BATCH_MAX_CHARS)
+    ) {
+      batches.push(current);
+      current = [];
+      size = 0;
+    }
+    current.push(pair);
+    size += pairSize;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
+
 /**
  * Independent claim-grounding check: a second pass whose only job is to
  * classify every claim the adapted copy adds over the original. Claims the
  * article supports are surfaced for review (article_claims); claims supported
  * by neither source become warnings that block approval until a human clears
  * them.
+ *
+ * The surfaces are checked in small batches (same prompt, same schema per
+ * call). A batch that still runs out of output budget is split in half and
+ * re-checked, down to one surface per call. A single surface that still
+ * cannot be checked fails the generation on article pages (the guard is
+ * their approval gate) and, on brief and Ingredient focus pages (review
+ * only, nothing blocks), records a "verify this whole section" finding
+ * instead. Surfaces a response omitted are re-checked once on their own.
  */
 export async function claimGuard(
   pairs: Array<{ key: string; original: string; adapted: string }>,
   articleText: string,
   mode: AdaptationMode = "standard",
   options: { source?: "article" | "brief" | "focus" } = {},
+): Promise<Map<string, ClaimFindings>> {
+  if (pairs.length === 0) return new Map();
+  const source = options.source ?? "article";
+  const reviewOnly = source === "brief" || source === "focus";
+  const map = new Map<string, ClaimFindings>();
+
+  const incomplete = (): ClaimFindings => ({
+    warnings: [source === "focus" ? `Product fact: ${GUARD_INCOMPLETE_NOTE}` : GUARD_INCOMPLETE_NOTE],
+    articleClaims: [],
+  });
+
+  const run = async (batch: typeof pairs, retried = false): Promise<void> => {
+    try {
+      const found = await claimGuardBatch(batch, articleText, mode, options);
+      for (const [key, findings] of found) {
+        if (batch.some((p) => p.key === key)) map.set(key, findings);
+      }
+    } catch (error) {
+      if (!(error instanceof GuardIncompleteError)) {
+        // A failed request (not a bad answer). Article pages fail as
+        // before; review-only pages try once more, then flag the sections.
+        if (!reviewOnly) throw error;
+        if (!retried) {
+          console.warn("Claim guard request failed; retrying once", error);
+          await new Promise((resolve) => setTimeout(resolve, GUARD_RETRY_PAUSE_MS));
+          await run(batch, true);
+          return;
+        }
+        console.error("Claim guard request failed twice; flagging sections", error);
+        for (const p of batch) if (!map.has(p.key)) map.set(p.key, incomplete());
+        return;
+      }
+      if (batch.length > 1) {
+        const half = Math.ceil(batch.length / 2);
+        await Promise.all([run(batch.slice(0, half)), run(batch.slice(half))]);
+        return;
+      }
+      if (!reviewOnly) throw error;
+      map.set(batch[0].key, incomplete());
+    }
+  };
+
+  await Promise.all(guardBatches(pairs).map((batch) => run(batch)));
+
+  // One retry, one surface per call, for anything a response left out.
+  const missing = pairs.filter((p) => !map.has(p.key));
+  if (missing.length > 0) {
+    await Promise.all(missing.map((p) => run([p])));
+  }
+  // Review-only pages never fail over a section the guard skipped twice:
+  // the section is flagged for a full manual check instead. Article pages
+  // keep failing (their callers reject an incomplete guard result).
+  if (reviewOnly) {
+    for (const p of pairs) {
+      if (!map.has(p.key)) {
+        map.set(p.key, incomplete());
+      }
+    }
+  }
+  return map;
+}
+
+async function claimGuardBatch(
+  pairs: Array<{ key: string; original: string; adapted: string }>,
+  articleText: string,
+  mode: AdaptationMode,
+  options: { source?: "article" | "brief" | "focus" },
 ): Promise<Map<string, ClaimFindings>> {
   if (pairs.length === 0) return new Map();
   const source = options.source ?? "article";
@@ -1386,7 +1520,7 @@ A "claim" is any factual assertion: benefits, results, ingredients, statistics, 
   const response = await client()
     .messages.stream({
       model: MODEL,
-      max_tokens: 8000,
+      max_tokens: GUARD_MAX_TOKENS,
       thinking: { type: "adaptive" },
       system:
         source === "focus"
@@ -1404,20 +1538,35 @@ A "claim" is any factual assertion: benefits, results, ingredients, statistics, 
     })
     .finalMessage();
 
-  const text = extractJsonText(response, "claim guard", source);
-  const parsed = parseModelJson(text, "claim guard") as {
+  if (response.stop_reason === "max_tokens") {
+    throw new GuardIncompleteError(GUARD_CUT_OFF_MESSAGE);
+  }
+  let parsed: {
     surfaces: Array<{
       key: string;
       unsupported_claims: string[];
       article_claims: string[];
     }>;
   };
+  try {
+    const text = extractJsonText(response, "claim guard", source);
+    parsed = parseModelJson(text, "claim guard") as typeof parsed;
+  } catch (error) {
+    // Declined or unreadable: same handling as a cut-off answer.
+    throw new GuardIncompleteError(error instanceof Error ? error.message : String(error));
+  }
+  if (!Array.isArray(parsed?.surfaces)) {
+    throw new GuardIncompleteError(
+      "The claim guard pass returned an unreadable response. Retry the generation.",
+    );
+  }
 
   const map = new Map<string, ClaimFindings>();
   for (const s of parsed.surfaces) {
+    if (!s || typeof s.key !== "string") continue;
     map.set(s.key, {
-      warnings: s.unsupported_claims,
-      articleClaims: s.article_claims,
+      warnings: Array.isArray(s.unsupported_claims) ? s.unsupported_claims : [],
+      articleClaims: Array.isArray(s.article_claims) ? s.article_claims : [],
     });
   }
   return map;
