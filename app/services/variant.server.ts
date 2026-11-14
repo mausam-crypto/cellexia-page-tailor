@@ -7,6 +7,7 @@ import type {
 } from "@prisma/client";
 import prisma from "../db.server";
 import { fetchArticle, fetchPublicHtml } from "./article.server";
+import { countryName, normalizePageCountry, renderedCountry } from "./countries";
 import {
   adaptFromBrief,
   analyzeAndAdapt,
@@ -875,7 +876,11 @@ function finalizeFocusPlan(
 
 /**
  * Original copy for live-page surfaces: fetch the rendered storefront
- * product page (locale-aware URL) and extract each configured region's
+ * product page (locale-aware URL, as a visitor from the country chosen in
+ * Settings - a store can show different copy per country, and without an
+ * explicit country Shopify picks one from this server's IP address, which
+ * is how the Irish version of a page once became every "Original") and
+ * extract each configured region's
  * inner HTML - heading and body together, exactly as the visitor sees it,
  * so the whole container can be adapted and swapped as one unit without
  * theme changes. Regions that don't exist on the page are skipped, like
@@ -886,6 +891,7 @@ async function getPageSurfaceContent(
   article: { productId: string; productHandle: string; locale: string },
   primaryLocale: string,
   pageSurfaces: CopySurface[],
+  pageCountry: string,
 ): Promise<SurfaceContent[]> {
   // A draft or unpublished product has no live page: nothing to read, and
   // nothing these surfaces could ever swap. Skip them so pre-launch variant
@@ -898,7 +904,8 @@ async function getPageSurfaceContent(
   const isPrimary =
     article.locale.toLowerCase() === primaryLocale.toLowerCase();
   const prefix = isPrimary ? "" : `/${article.locale.toLowerCase()}`;
-  const url = `${base}${prefix}/products/${article.productHandle}`;
+  const country = normalizePageCountry(pageCountry);
+  const url = `${base}${prefix}/products/${article.productHandle}?country=${country}`;
 
   let html: string;
   try {
@@ -910,6 +917,17 @@ async function getPageSurfaceContent(
       `Could not read the live product page (${url}) for the live-page surfaces: ${
         error instanceof Error ? error.message : String(error)
       }. Retry, or disable the live-page surfaces in Settings.`,
+    );
+  }
+
+  // A country the store does not sell to is ignored by Shopify, which then
+  // falls back to this server's location: exactly the silent wrong-country
+  // read the setting exists to prevent. Fail loudly instead. A page that
+  // does not state its country (unusual theme) is accepted as it is.
+  const shown = renderedCountry(html);
+  if (shown && shown !== country) {
+    throw new Error(
+      `The store showed the live product page as a visitor from ${countryName(shown)}, not ${countryName(country)} - most likely because the store does not sell to ${countryName(country)}. In Settings, set "Read live pages as a visitor from" to a country the store sells to, save, then retry.`,
     );
   }
 
@@ -1382,7 +1400,13 @@ async function collectBaseSurfaces(
   );
   if (pageSurfaces.length > 0) {
     surfaces.push(
-      ...(await getPageSurfaceContent(admin, article, primary, pageSurfaces)),
+      ...(await getPageSurfaceContent(
+        admin,
+        article,
+        primary,
+        pageSurfaces,
+        settings.pageCountry,
+      )),
     );
   }
   if (surfaces.length === 0) {

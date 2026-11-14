@@ -7,6 +7,7 @@ import {
   normalizeIllustrationSettings,
   normalizeSubtleSettings,
 } from "./types";
+import { DEFAULT_PAGE_COUNTRY, normalizePageCountry } from "./countries";
 
 export { unsafeSelectorReason } from "./selector-rules";
 
@@ -102,6 +103,7 @@ export async function getSettings(shop: string): Promise<ShopSettingsData> {
       basketRenameEnabled: false,
       cartTransformId: null,
       basketRenameError: null,
+      pageCountry: DEFAULT_PAGE_COUNTRY,
     };
   }
   let subtleRaw: unknown = {};
@@ -140,6 +142,7 @@ export async function getSettings(shop: string): Promise<ShopSettingsData> {
     basketRenameEnabled: row.basketRenameEnabled,
     cartTransformId: row.cartTransformId,
     basketRenameError: row.basketRenameError,
+    pageCountry: normalizePageCountry(row.pageCountry),
   };
 }
 
@@ -166,6 +169,7 @@ export async function saveSettings(
       data.basketRenameError !== undefined
         ? data.basketRenameError
         : current.basketRenameError,
+    pageCountry: normalizePageCountry(data.pageCountry ?? current.pageCountry),
   };
   const fields = {
     paramName: merged.paramName,
@@ -177,6 +181,7 @@ export async function saveSettings(
     basketRenameEnabled: merged.basketRenameEnabled,
     cartTransformId: merged.cartTransformId,
     basketRenameError: merged.basketRenameError,
+    pageCountry: merged.pageCountry,
   };
   await prisma.shopSettings.upsert({
     where: { shop },

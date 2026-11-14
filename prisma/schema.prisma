@@ -36,6 +36,11 @@ model ShopSettings {
   basketRenameEnabled Boolean @default(false)
   cartTransformId     String?
   basketRenameError   String?
+  // Country (ISO code) the live product page is read as when collecting the
+  // original copy of live-page surfaces. Stores can show different copy per
+  // country, and without an explicit country Shopify picks one from the app
+  // server's IP address.
+  pageCountry    String   @default("US")
   updatedAt      DateTime @updatedAt
 }
 

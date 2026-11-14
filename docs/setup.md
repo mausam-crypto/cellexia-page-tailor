@@ -150,6 +150,14 @@ on the product page:
     embed's "Selectors to hold during swap" setting to avoid a flash of the
     old name. Swap mode is always Plain text.
 
+11. **Country of the live page:** live page regions take their original
+    copy from the public product page. If the store shows different copy in
+    some countries (Shopify Markets), Settings > Copy surfaces > "Read live
+    pages as a visitor from" decides which country's version the app reads
+    (default United States). Choose a country the store sells to; otherwise
+    Shopify falls back to the country of the app's server and the
+    generation stops with a message naming both countries.
+
 ## 4. Locales
 
 - Articles are created per product **and per language**; generation uses the

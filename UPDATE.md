@@ -3,7 +3,59 @@
 This guide is for updating an already-deployed installation. For first-time
 setup, use [INSTALL.md](INSTALL.md).
 
-## What's new in this update (2026-11-07 — Ingredient focus pages and the basket rename)
+## What's new in this update (2026-11-14 — the country the live page is read as)
+
+**The bug.** The "Original" copy of the live-page surfaces (tagline,
+Overview, Benefits, Science, FAQs tabs) is read from the public product
+page. A store can show different copy per country, and when a request does
+not say which country it comes from, Shopify picks one from the caller's IP
+address. For the app that is the location of its server. On the Cellexia
+store, Ireland alone gets a softer version of the product copy, the app's
+server is treated as Irish, and so every page (article and brief alike) was
+built from the Irish version instead of the copy every other country sees.
+
+**The fix.** Settings > Copy surfaces has a new choice, **Read live pages
+as a visitor from** (default: United States). The app now asks the store
+for that country's version every time it reads a live page
+(`?country=XX` on the page address). If the store answers with another
+country's page (it does that when it does not sell to the chosen country),
+the generation fails with a message naming both countries instead of
+silently using the wrong copy.
+
+**Updating (short, this release only):**
+
+1. Replace the code as in "Update steps" below (keep your
+   `shopify.app.toml`, `.env` and database). `npm install` adds nothing new.
+2. Redeploy the server. The boot command applies this release's one
+   migration (`page_country`: one defaulted column on ShopSettings).
+   No `npm run deploy` is needed: the theme extension, the function and
+   the scopes did not change.
+3. Open Settings and check **Read live pages as a visitor from**. Leave
+   United States, or pick the country whose copy you want pages built
+   from. It must be a country the store sells to. Save.
+4. **Regenerate existing pages.** Pages generated before this update keep
+   the copy they were built from (the Irish version) until they are
+   regenerated.
+
+**To check after updating (not yet run by anyone):**
+
+1. Regenerate one page for Collagen Hair Renewal Serum. On its review
+   page, the Overview tab's *Original* starts with "CONDITIONER ISN'T
+   ENOUGH FOR YOUR HAIR & SCALP" and ends with the "INSPIRED BY NOBEL
+   PRIZE-WINNING SCIENCE ON CELLULAR AGING" section.
+2. Set the country to Ireland, save, regenerate the same page: the
+   *Original* is the softer version again ("BEYOND CONDITIONING..."). Set
+   the country back and regenerate.
+3. Set the country to one the store does not sell to (e.g. India), save,
+   regenerate: the generation fails with "The store showed the live product
+   page as a visitor from ..., not India". Set the country back.
+
+**Know before you rely on it:** a variant link shows the same adapted copy
+to visitors from every country. With the country set to anything but
+Ireland, an Irish visitor arriving through a variant link sees copy built
+from the full version, not from the softer Irish one.
+
+## What's new in the previous update (2026-11-07 — Ingredient focus pages and the basket rename)
 
 > **Same-day fix (2026-11-07, zip rebuilt):** the first build of this release
 > made EVERY article generation fail with "The compiled grammar is too large"
@@ -80,7 +132,7 @@ run `npm install`, not `npm ci`, once after unzipping). See README →
   from the theme developer (basket drawer/page and order notifications),
   documented in docs/setup.md §9.
 
-## What's new in the previous update (2026-10-21 — illustrations)
+## What's new in the update before that (2026-10-21 — illustrations)
 
 Brief- and article-based pages can now carry a clinical-style illustration in
 the Science and Overview tabs. This release ships **one database migration**
@@ -112,7 +164,7 @@ for the feature itself; in short:
 - **Claim guard**: caption, alt text and drawing prompt are checked and
   listed under *Unverified claims* (information only).
 
-## What's new in the update before that (2026-10-21 — briefs, refinements, version history)
+## What's new in the 2026-10-21 update (briefs, refinements, version history)
 
 This release adds a second way to create variants and a history for every
 variant. It **ships one database migration** (`briefs_and_versions`), **no
@@ -459,6 +511,11 @@ review page now shows a *Version history* with a baseline version
 
 - Draft/unpublished products: live-page surfaces are skipped automatically
   (there is no live page to read); the admin-sourced surfaces still generate.
+- Country of the live page: live-page surfaces are read as a visitor from
+  the country chosen in Settings ("Read live pages as a visitor from",
+  default United States). Choose a country the store sells to; if the store
+  answers with another country's page, generation fails with a message
+  naming both countries.
 - Password-protected storefronts: generation fails with a clear error while
   the password is on, because the app cannot read the live page regions.
 - Background queue and hosting: the queue lives in the app's server process.

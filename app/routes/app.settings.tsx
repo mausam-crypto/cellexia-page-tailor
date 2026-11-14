@@ -37,6 +37,7 @@ import {
   surfaceKeyForMetafield,
 } from "../services/settings.server";
 import { unsafeSelectorReason } from "../services/selector-rules";
+import { countryOptions, normalizePageCountry } from "../services/countries";
 import {
   getProductMetafieldDefinitionsCached,
   type MetafieldDefinitionSummary,
@@ -170,6 +171,8 @@ export const loader = async ({ request }: LoaderFunctionArgs) => {
     intensity: settings.intensity,
     subtle: settings.subtle,
     servingEnabled: settings.servingEnabled,
+    pageCountry: settings.pageCountry,
+    countryOptions: countryOptions(),
     approvedCount,
     metafieldsUnavailable,
     rows,
@@ -220,6 +223,10 @@ export const action = async ({ request }: ActionFunctionArgs) => {
       ? (intensityRaw as "medium" | "deep")
       : ("light" as const);
   const servingEnabled = formData.get("servingEnabled") === "true";
+  // Absent from the form (older cached admin page): keep the saved value.
+  const pageCountryRaw = formData.get("pageCountry");
+  const pageCountry =
+    pageCountryRaw === null ? undefined : normalizePageCountry(pageCountryRaw);
 
   // Field-by-field fallback to defaults: a malformed value can never make
   // the subtle dials unsaveable.
@@ -357,6 +364,7 @@ export const action = async ({ request }: ActionFunctionArgs) => {
     surfaces,
     servingEnabled,
     illustrations,
+    pageCountry,
   });
 
   // The basket name map follows the serving switch and the Product name
@@ -407,6 +415,7 @@ export default function Settings() {
   const [servingEnabled, setServingEnabled] = useState(
     loaderData.servingEnabled,
   );
+  const [pageCountry, setPageCountry] = useState<string>(loaderData.pageCountry);
   const [rows, setRows] = useState<CopySurface[]>(loaderData.rows);
   const [quality, setQuality] = useState<IllustrationQuality>(
     loaderData.illustrations.quality,
@@ -465,6 +474,7 @@ export default function Settings() {
         intensity,
         subtle: JSON.stringify(subtle),
         servingEnabled: String(servingEnabled),
+        pageCountry,
         surfaces: JSON.stringify(rows),
         illustrations: JSON.stringify({
           quality,
@@ -479,6 +489,7 @@ export default function Settings() {
     intensity,
     subtle,
     servingEnabled,
+    pageCountry,
     rows,
     quality,
     monthlyCap,
@@ -880,6 +891,14 @@ export default function Settings() {
                     .product__description.
                   </Text>
                 </BlockStack>
+
+                <Select
+                  label="Read live pages as a visitor from"
+                  options={loaderData.countryOptions}
+                  value={pageCountry}
+                  onChange={setPageCountry}
+                  helpText="Live page regions take their original copy from your public product page. If your store shows different copy in some countries, the app reads the version a visitor from this country sees. Choose a country you sell to. Pages generated before a change keep the copy they were built from until you regenerate them."
+                />
 
                 {rows.map((row) => (
                   <Box

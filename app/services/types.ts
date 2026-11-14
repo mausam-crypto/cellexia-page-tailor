@@ -324,6 +324,10 @@ export interface ShopSettingsData {
   basketRenameEnabled: boolean;
   cartTransformId: string | null;
   basketRenameError: string | null;
+  /** ISO country code the live product page is read as for live-page
+   *  surfaces (stores can show different copy per country; without this
+   *  Shopify picks the country from the app server's location). */
+  pageCountry: string;
 }
 
 /** Base copy for one surface, already localized for the target locale. */
